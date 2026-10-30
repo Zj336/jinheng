@@ -331,6 +331,7 @@ jinheng/
 ├── capabilities.py         ★ 能力清单（读工具注册表，--json 可机读）
 ├── llm_smoke.py            ★ 真模型联调表（mock vs 真模型并排对照，无断言）
 ├── .github/workflows/ci.yml   CI：在 ubuntu 上跑同一条 selfcheck.py
+│                              （顺带证明沙箱的进程树杀灭/内存看门狗不是 Windows 特化）
 └── run.py                  一键启动
 ```
 

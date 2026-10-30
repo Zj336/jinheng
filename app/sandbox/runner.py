@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -121,13 +122,34 @@ if sys.platform == "win32":
 
 
 def _rss_mb(pid: int) -> float | None:
-    """Windows：取进程 WorkingSetSize。其他平台返回 None（用超时兜底）。
+    """取子进程常驻内存（MB）。读不到返回 None，由超时兜底。
 
-    ★ 坑：必须显式声明 restype/argtypes。ctypes 默认把返回值当 32 位 int，
+    * Windows：WorkingSetSize（psapi）
+    * Linux：/proc/<pid>/status 的 VmRSS
+    * 其他（macOS 等）：返回 None —— 只保证超时，不假装有内存上限
+
+    ★ 为什么必须补上 Linux 这条：
+      CI 在 ubuntu 上跑，而内存看门狗原来只有 Windows 实现，
+      于是「内存炸弹必被杀」这条用例在 CI 上必挂（实际是变成超时）。
+      限制只在某一个操作系统上生效，等于没有这个限制——
+      换台机器就漏，而这正是安全能力最不该有的性质。
+
+    ★ Windows 的坑：必须显式声明 restype/argtypes。ctypes 默认把返回值当 32 位 int，
       而 64 位 Windows 的 HANDLE 是指针 —— 不声明就会被截断，OpenProcess
       可能「成功」拿到一个完全不相干的进程句柄，于是读到的是别人的内存
       （表现为：子进程明明吃了 300MB，却恒定读回 4MB）。
     """
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        # 单位是 kB
+                        return int(line.split()[1]) / 1024
+        except (OSError, IndexError, ValueError):
+            return None
+        return None
+
     if sys.platform != "win32":
         return None
 
@@ -154,7 +176,7 @@ def _rss_mb(pid: int) -> float | None:
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """连子孙一起杀。Windows 用 taskkill /T；其他平台尽力而为。"""
+    """连子孙一起杀。Windows 用 taskkill /T；POSIX 杀整个进程组。"""
     if proc.poll() is not None:
         return
     try:
@@ -164,7 +186,13 @@ def _kill_tree(proc: subprocess.Popen) -> None:
                 capture_output=True, timeout=10,
             )
         else:
-            proc.kill()
+            # ★ 只 kill 子进程不够：它 fork 出来的孙进程会活下来继续吃资源。
+            #   子进程是用 start_new_session=True 起的（自成进程组），
+            #   所以 killpg 只会打到自己这一组，不会波及服务本身。
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                proc.kill()
     except (OSError, subprocess.SubprocessError):
         try:
             proc.kill()
@@ -224,6 +252,8 @@ def run_code(code: str, data: dict, timeout_s: float | None = None,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             cwd=tmpdir, env=_child_env(tmpdir),
+            # POSIX：自成进程组，才能 killpg 把孙进程一起收走（见 _kill_tree）
+            **({"start_new_session": True} if sys.platform != "win32" else {}),
         )
     except OSError as exc:
         return SandboxResult(ok=False, error=f"沙箱进程启动失败：{exc}", code_digest=digest)
