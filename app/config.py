@@ -52,6 +52,12 @@ class Settings:
     llm_api_key: str = os.getenv("JH_LLM_API_KEY", "")
     llm_model: str = os.getenv("JH_LLM_MODEL", "gpt-4o-mini")
     llm_timeout_s: float = float(os.getenv("JH_LLM_TIMEOUT", "30"))
+    # 429/5xx 的重试次数（含首次）。真机联调时第一轮 12 句全挂，
+    # 就是被一次限流打穿了——不重试的话「偶发」会被当成「不支持」。
+    llm_retries: int = _i("JH_LLM_RETRIES", 3)
+    # 输出上限。意图 + 计划是短 JSON，给太多只会拖慢：实测 DeepSeek 单轮 3~9 秒，
+    # 其中相当一部分耗在「允许它写很长」上。
+    llm_max_tokens: int = _i("JH_LLM_MAX_TOKENS", 512)
 
     # ---- 权限分级阈值（对应赛题「日累计 ≤ 1000 元」）----
     # 注意：比的是「日累计」，不是「单笔」。见 docs/权限分级规格.md

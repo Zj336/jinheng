@@ -33,8 +33,9 @@ def _analyze(conn: sqlite3.Connection, ctx: UserContext, args: AnalyzeArgs) -> T
     rows = recent_transactions(conn, ctx.user_id, args.days)
     items = [dict(r) for r in rows]
 
+    payload = {"days": args.days, "items": items}
     code, generator = codegen.generate(args.goal, args.days)
-    outcome = run_code(code, {"days": args.days, "items": items})
+    outcome = run_code(code, payload)
 
     sandbox_meta = {
         "generator": generator,
@@ -43,6 +44,35 @@ def _analyze(conn: sqlite3.Connection, ctx: UserContext, args: AnalyzeArgs) -> T
         "killed": outcome.killed,
         "code": codegen.preview(code),
     }
+
+    # ---- ★ 契约校验：模型可以自由写代码，但产物必须对得上表述层 ----
+    # 真机联调踩到的坑：模型写的代码算得对，但把结果组织成 {"breakdown": [...]}，
+    # 而表述层读的是 {"rows": [...]} → 打印「近 30 天没有支出记录」，实际有 11 笔。
+    # 没有异常、没有日志，只是安静地答错。所以加一道结构校验 + 模板回落。
+    problem = None if outcome.ok else (outcome.error or "沙箱执行失败")
+    if outcome.ok:
+        problem = codegen.validate_result(args.goal, outcome.result, items)
+
+    if problem:
+        fb_code = codegen.template_code(args.goal)
+        fb = run_code(fb_code, payload)
+        fb_ok = fb.ok and codegen.validate_result(args.goal, fb.result, items) is None
+        sandbox_meta["fallback"] = {"from": generator, "to": "template", "reason": problem}
+        if not fb_ok:
+            return ToolResult(
+                ok=False,
+                tool="analyze_spending",
+                error=f"{problem}；确定性模板也未能产出可用结果：{fb.error or '结构不符'}",
+                data={"goal": args.goal, "days": args.days, "sandbox": sandbox_meta},
+            )
+        # 如实记录：这份结论**不是**模型写的代码算出来的
+        code, generator, outcome = fb_code, "template(fallback)", fb
+        sandbox_meta.update({
+            "generator": generator,
+            "code_digest": outcome.code_digest,
+            "elapsed_ms": outcome.elapsed_ms,
+            "code": codegen.preview(code),
+        })
 
     if not outcome.ok:
         return ToolResult(

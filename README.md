@@ -45,7 +45,7 @@ python run.py
 ```bash
 python selfcheck.py          # 期望：三项全 PASS，退出码 0（它就是上面三条的合集）
 python demo.py               # 期望：50/50 通过
-python -m pytest tests -q    # 期望：110 passed
+python -m pytest tests -q    # 期望：125 passed
 python eval_report.py        # 期望：31/31 与 11/11
 ```
 
@@ -322,7 +322,7 @@ jinheng/
 │   ├── tools/              工具注册表与实现（12 个工具 / 6 个场景）
 │   ├── eval/               对抗评估（31 条攻击 + 对照系统）
 │   └── api/routes.py       HTTP 接口
-├── tests/                  110 个用例（含 test_security_hardening.py 10 条）
+├── tests/                  125 个用例（含 test_security_hardening.py 10 条、test_codegen_contract.py 13 条）
 ├── docs/                   权限分级规格（安全自评报告待补）
 ├── eval/                   attacks.yaml / sandbox_attacks.yaml
 ├── demo.py                 演示 + 验收脚本（14 场景 / 50 断言）
@@ -391,8 +391,15 @@ jinheng/
 
 **待办**
 
-- [ ] 真实 LLM 接入验证：脚本已备好（`llm_smoke.py`，会把 mock 与真模型的解析结果并排打出来），
-      **只差一个 API Key**。配好后 `python llm_smoke.py` 一次出对照表
+- [x] 真实 LLM 接入验证：**2026-10-30 用 DeepSeek（`deepseek-chat`）实跑**。
+      `python llm_smoke.py` 同一批 12 句口语：**真模型一次听懂 75.0%（9/12），mock 75.0%（9/12）**，
+      平均 2.3 s/句、峰值 4.5 s/句，无超时、无非法 JSON、无未注册工具。
+      ⚠️ 口径要说清：那 3 句都是真模型**主动追问**、不是听不懂——
+      「再给他转100」缺收款人、「明天把房租转给房东」缺金额、「帮我把钱都归拢一下」需澄清指的是什么。
+      逐句差异与两次「安静地答错」的修复见 `讨论记录/2026-10-30_07_真模型联调与代码产出契约.md`
+- [x] 模型生成代码的**产出契约校验**：结构不符 / 判据明显跑偏时自动回落确定性模板，
+      并在回复末尾与 `sandbox.fallback` 里如实标注「这一轮的数字是模板算的」
+- [x] 真模型生成的代码里没有 `datetime`（沙箱禁 import）：提示词里已写死按字符串切片解析时间
 - [ ] 安全自评报告（`docs/` 下只有权限分级规格）
 - [ ] 演示视频与 Docker 一键部署
 

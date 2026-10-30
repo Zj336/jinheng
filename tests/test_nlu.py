@@ -58,6 +58,22 @@ def test_pronoun_recipient_asks_instead_of_denying():
     assert "还差" in r.text or "指的是谁" in r.text
 
 
+def test_clarifying_turn_says_so_in_its_result():
+    """追问这件事要由引擎说清楚，不能让调用方去文案里猜。
+
+    mock 生成的追问带「还差…请补充」，真模型生成的不带——只按关键字判断，
+    同一件事在对照表里会被记成两种结果（真模型的追问被记成「其他(说明类)」）。
+    """
+    r = _say("nlu9", "再给他转100")
+    assert r.clarify, "该轮是追问，clarify 不该为空"
+    assert not r.executed and not r.pending
+
+
+def test_a_completed_turn_is_not_marked_as_clarifying():
+    r = _say("nlu10", "查一下余额")
+    assert r.clarify == [], "办完的轮次不该被标成追问"
+
+
 def test_balance_question_still_works():
     """修 bug 不能把原来对的也修坏。"""
     for s, q in (("nlu6", "查一下余额"), ("nlu7", "我还有多少钱"), ("nlu8", "卡里有多少钱")):

@@ -88,6 +88,8 @@ class ChatOut(BaseModel):
     skipped: list[dict] = []
     guard_hits: list[str] = []
     locked: bool = False
+    # ★ 这一轮是不是在追问（缺槽位 / 需要澄清）。调用方不必再去回复文案里猜。
+    clarify: list[str] = []
 
 
 @router.get("/health", tags=["运维"])
@@ -198,6 +200,7 @@ def chat(body: ChatIn, authorization: str | None = Header(default=None)) -> Chat
         session_id=r.session_id, text=r.text, trace_id=r.trace_id,
         executed=r.executed, denied=r.denied, pending=r.pending,
         skipped=r.skipped, guard_hits=r.guard_hits, locked=r.locked,
+        clarify=r.clarify,
     )
 
 

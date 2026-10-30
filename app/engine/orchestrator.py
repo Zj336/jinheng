@@ -110,6 +110,10 @@ class TurnResult:
     skipped: list[dict] = field(default_factory=list)
     guard_hits: list[str] = field(default_factory=list)
     locked: bool = False
+    # ★ 这一轮是不是在向用户追问。以前只能靠「回复里有没有『还差』」猜——
+    #   mock 生成的追问带这两个字，真模型生成的追问不带，于是同一件事在对照表里
+    #   被记成了两种结果。行为描述不该靠文案关键字推断，所以由引擎直接说清楚。
+    clarify: list[str] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -282,7 +286,8 @@ class Orchestrator:
                 audit(conn, trace_id=ctx.trace_id, stage="render", payload={"text": text},
                       user_id=user_id, session_id=ctx.session_id)
                 return TurnResult(session_id=ctx.session_id, text=text,
-                                  trace_id=ctx.trace_id, guard_hits=env.hits)
+                                  trace_id=ctx.trace_id, guard_hits=env.hits,
+                                  clarify=list(proposal.clarifications))
 
             return self._run_plan(conn, ctx, proposal.plan, env.hits)
 

@@ -125,14 +125,47 @@ def template_code(goal: str) -> str:
     return _TEMPLATES[goal].strip() + "\n"
 
 
+# ★ 输出契约必须逐字写进提示词。
+#   真机联调第一轮就踩了这个坑：模型写出的代码是对的，但它把结果组织成
+#   {"window_days":…, "breakdown":[…]},而表述层要读 {"rows":[…]}
+#   —— 于是「近 30 天没有支出记录」被打印出来，**明明有 11 笔支出**。
+#   没有报错、没有异常，只是安静地答错。这类错误比崩溃危险得多。
+_CONTRACT = {
+    "category_breakdown": """result 必须恰好是：
+{"rows": [{"category": str, "cents": int, "count": int, "pct_bp": int,
+           "top": [{"merchant": str, "cents": int}]}],
+ "count": int, "total_cents": int}
+- rows 按 cents 降序；pct_bp 是占比的万分比整数（91.55% → 9155）
+- top 给前 3 个商户，只对类目名为「其他」或占比 ≥ 20% 的类目给（没有就给空列表）""",
+    "top_merchants": """result 必须恰好是：
+{"rows": [{"merchant": str, "cents": int, "pct_bp": int}], "total_cents": int}
+- 最多 5 行，按 cents 降序""",
+    "anomalies": """result 必须恰好是：
+{"rows": [{"ts": str, "counterparty": str, "cents": int, "reasons": [str]}],
+ "count": int, "flagged_cents": int, "scanned": int}
+- reasons 用中文短语，只能是这四种，判定条件**逐字照此执行**，不要自行发明：
+  「深夜交易」= 交易时间 0:00–5:59
+  「大额」    = 单笔 ≥ 100000 分（1000 元）
+  「陌生商户」= 商户名为空，或商户名里含「未知」二字（如「未知商户」）
+  「境外商户」= 商户名里含「境外」二字（如「某境外商户」）
+- 商户名里出现汉字、英文品牌名（瑞幸咖啡 / 美团外卖 / 爱奇艺）**都不算陌生商户**""",
+    "trend": """result 必须恰好是：
+{"rows": [{"week": str, "cents": int}], "total_cents": int}
+- week 形如「10 月第 2 周」，按时间升序""",
+}
+
+
 _LLM_SYS = """你是数据分析代码生成器。根据要求输出**一段 Python 代码**，不要任何解释、不要 markdown 代码块围栏。
 
 硬性约束：
 - 变量 data 已存在，是 dict：{"days": int, "items": [ {"ts": "YYYY-MM-DDTHH:MM:SS", "direction": "in|out", "amount_cents": int, "counterparty": str, "category": str, "memo": str} ]}
 - 必须给变量 result 赋值一个 dict，只含可 JSON 序列化的类型（dict/list/str/int/float/bool/None）
 - 金额单位一律是「分」（整数），所有金额运算必须用整数，禁止用浮点做钱的加减
+- 只统计 direction == "out" 的记录
 - 禁止 import、禁止 open、禁止 eval/exec、禁止访问任何双下划线属性
 - 只用内建函数：len/sum/min/max/sorted/range/int/str/dict/list/set/float/round
+- **没有 datetime / time / re / json 模块可用**（沙箱不允许 import）。时间一律按字符串切片解析：
+  `ts` 形如 "2026-10-20T14:00:00"，年 ts[0:4]、月 ts[5:7]、日 ts[8:10]、时 ts[11:13]
 """
 
 
@@ -145,7 +178,8 @@ def llm_code(goal: str, days: int) -> str | None:
 
     user = (
         f"分析目标：{_RENDER_HINT.get(goal, goal)}\n"
-        f"时间窗口：近 {days} 天\n"
+        f"时间窗口：近 {days} 天\n\n"
+        f"输出契约（对象字段名必须完全一致，表述层按它取值）：\n{_CONTRACT.get(goal, '')}\n\n"
         f"请只输出代码。"
     )
     try:
@@ -172,6 +206,89 @@ def llm_code(goal: str, days: int) -> str | None:
     return text or None
 
 
+def validate_result(goal: str, result, items: list[dict]) -> str | None:
+    """检查生成代码的产出有没有按契约来。None = 合格，否则返回人话原因。
+
+    ★ 为什么不只看「跑没跑起来」：代码跑通了、返回了一个结构不同的 dict，
+      表述层读不到 `rows` 就会打印「近 30 天没有支出记录」——而账上明明有 11 笔。
+      **安静地答错比直接报错危险得多**，所以这里有一道结构校验：
+      模型可以自由地写代码，但产物必须能对上表述层的契约，对不上就回落模板。
+    """
+    if not isinstance(result, dict):
+        return f"结果不是 JSON 对象（拿到 {type(result).__name__}）"
+
+    out_items = [i for i in items if i.get("direction") == "out"]
+    out_total = sum(int(i.get("amount_cents") or 0) for i in out_items)
+
+    def need_list(key: str) -> list | None:
+        value = result.get(key)
+        return value if isinstance(value, list) else None
+
+    def need_int(key: str) -> bool:
+        return isinstance(result.get(key), int)
+
+    if goal in ("category_breakdown", "top_merchants", "trend"):
+        rows = need_list("rows")
+        if rows is None:
+            return "缺少 rows 列表（字段名必须是 rows）"
+        if not need_int("total_cents"):
+            return "缺少整数 total_cents"
+        if out_items and not rows:
+            return f"输入有 {len(out_items)} 笔支出，结果却是空的"
+        if out_items and int(result.get("total_cents") or 0) <= 0:
+            return "输入有支出，结果合计却为 0"
+        key = {"category_breakdown": "category", "top_merchants": "merchant", "trend": "week"}[goal]
+        if rows and key not in rows[0]:
+            return f"rows 里缺少 {key} 字段"
+        return None
+
+    if goal == "anomalies":
+        for key in ("rows", "count", "flagged_cents", "scanned"):
+            if key not in result:
+                return f"缺少 {key}"
+        rows = need_list("rows")
+        if rows is None:
+            return "rows 不是列表"
+        if out_items and need_int("scanned") and result["scanned"] < len(out_items):
+            return f"只扫描了 {result['scanned']} 笔，输入实际有 {len(out_items)} 笔支出"
+
+        # ★ 第二层：结构对了，判据也可能是坏的。
+        #   真机联调实测：模型写了个「商户名里含白名单以外的字就算陌生商户」，
+        #   于是瑞幸咖啡、美团外卖全被标成陌生商户 → 12 笔扫描、12 笔异常。
+        #   结构完全合法，答案完全没用。下面两条是能在不重新实现业务判断的前提下
+        #   抓到的两种塌陷：① 全中（分母没了）② 深夜/大额硬线索漏标。
+        scanned = int(result.get("scanned") or 0)
+        if scanned >= 3 and len(rows) >= scanned:
+            return f"{scanned} 笔支出全部被标为异常，判定条件等于没生效"
+
+        def hard_hit(item: dict) -> bool:
+            """目标定义里写死的判定条件。这四条不依赖任何主观判断，
+            少标一笔都说明生成的代码没按定义做。"""
+            ts = str(item.get("ts") or "")
+            hour = int(ts[11:13]) if len(ts) >= 13 else 12
+            cp = str(item.get("counterparty") or "")
+            return (hour < 6
+                    or int(item.get("amount_cents") or 0) >= 100000
+                    or "未知" in cp
+                    or "境外" in cp)
+
+        must = [i for i in out_items if hard_hit(i)]
+        if must:
+            # 用 (时间, 金额) 认账：模型常常把缺失的商户名改写成「未知商户」，
+            # 拿商户名当键会误判成漏标，造成不必要的回落。
+            flagged = {
+                (str(r.get("ts") or ""), int(r.get("cents") or 0))
+                for r in rows if isinstance(r, dict)
+            }
+            missed = [i for i in must
+                      if (str(i.get("ts") or ""), int(i.get("amount_cents") or 0)) not in flagged]
+            if missed:
+                return f"有 {len(missed)} 笔深夜或大额交易没被标出，判据与目标定义不符"
+        return None
+
+    return None
+
+
 def generate(goal: str, days: int) -> tuple[str, str]:
     """返回 (代码, 生成器名)。生成器名会写进审计日志，便于复现。"""
     code = llm_code(goal, days)
@@ -186,4 +303,4 @@ def preview(code: str, limit: int = 400) -> str:
     return one if len(one) <= limit else one[:limit] + " …"
 
 
-__all__ = ["Goal", "generate", "llm_code", "preview", "template_code"]
+__all__ = ["Goal", "generate", "llm_code", "preview", "template_code", "validate_result"]

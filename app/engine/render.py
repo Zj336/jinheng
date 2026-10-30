@@ -72,6 +72,11 @@ def _render_analyze_spending(r: ToolResult) -> str:
         f"\n（分析代码由「{sbx.get('generator', '—')}」生成，在沙箱子进程内执行 "
         f"{sbx.get('elapsed_ms', 0)} ms，代码指纹 {sbx.get('code_digest', '—')}）"
     )
+    # ★ 回落要写在用户看得见的地方。模型写的代码产出不符合契约时，我们换成了
+    #   确定性模板——数字仍然是对的，但「是谁算的」变了，不能默默换掉。
+    fb = sbx.get("fallback")
+    if fb:
+        tail += f"\n（注：模型生成的代码{fb.get('reason') or '产出结构不符'}，已改用确定性模板重算，数字以本结果为准。）"
 
     if goal == "category_breakdown":
         rows = res.get("rows") or []
