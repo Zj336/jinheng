@@ -337,15 +337,26 @@ class Orchestrator:
         else:
             return None
 
+        # ★ 一次确认只授权**一步**。凭证上写明它放行的是哪一步（row["step_id"]），
+        #   同计划里同级别的后续步骤不会蹭到这张票——它们会各自再出确认卡片。
+        #   修之前：用户只看到「转 300」的卡片，回一句「确认」后，
+        #   计划里第二笔 300 也被 P-061 自动放行，等于一次确认转出 600。
+        ctx.verified_for_step = row["step_id"]
+
         audit(conn, trace_id=ctx.trace_id, stage="decide",
-              payload={"resume": row["id"], "kind": row["kind"]},
+              payload={"resume": row["id"], "kind": row["kind"], "scope": row["step_id"]},
               user_id=ctx.user_id, session_id=ctx.session_id)
         pending.mark(conn, row["id"], "approved")
 
         plan = Plan(steps=[Step(**s) for s in steps])
-        result = self._run_plan(conn, ctx, plan, [], origin="resume", prior_results=results)
-        ctx.verified_factors = []   # 一次性凭证，用完即焚
-        return result
+        try:
+            return self._run_plan(conn, ctx, plan, [], origin="resume", prior_results=results)
+        finally:
+            # 一次性凭证，用完即焚——包括抛异常的路径。
+            # 修之前没有 try/finally：中途一出错，'mfa' 就留在会话里，
+            # 下一笔全新的转账会被 P-062 直接放行、不再发码。
+            ctx.verified_factors = []
+            ctx.verified_for_step = ""
 
     # -------------------------------------------------------------- 执行计划
 

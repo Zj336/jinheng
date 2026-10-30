@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.bank.db import (
     find_wealth_products,
@@ -99,12 +99,40 @@ class PurchaseArgs(BaseModel):
     amount_cents: int = Field(gt=0, le=50_000_000, description="申购金额，单位分")
 
 
-def _precheck_purchase(conn: sqlite3.Connection, user_id: str, args: PurchaseArgs) -> str | None:
+# 风险偏好 → 允许购买的最高产品风险等级。
+# ★ 不匹配就**硬拒**，而不是「升级到红色、验个码就放行」——
+#   适当性管理约束的是「这笔产品该不该卖给你」，不是「你是不是本人」。
+#   让多因子认证去覆盖它，和让验证码覆盖限额是同一个错误。
+_RISK_ORDER = ["低", "中", "高"]
+_MAX_RISK = {"保守": "低", "稳健": "低", "平衡": "中", "进取": "高"}
+
+
+def _precheck_purchase(
+    conn: sqlite3.Connection, user_id: str, args: PurchaseArgs
+) -> str | tuple[str, str] | None:
     """在要人脸/短信之前，先把「买不成」的情况挡掉。"""
     product, err = _resolve_product(conn, args.product)
     if err:
         return err
     assert product is not None
+
+    # ---- 适当性：产品风险 ≤ 客户偏好 ----
+    user = conn.execute("SELECT risk_pref FROM users WHERE id=?", (user_id,)).fetchone()
+    pref = (user["risk_pref"] if user else "") or ""
+    allowed_max = _MAX_RISK.get(pref)
+    if allowed_max is None:
+        # 偏好缺失/取值不认识 → fail-closed：不知道怎么判就不卖
+        return ("未查到您的风险测评结果，暂时无法购买理财（请先完成风险测评）", "P-070")
+    if _RISK_ORDER.index(product["risk_level"]) > _RISK_ORDER.index(allowed_max):
+        return (
+            f"「{product['name']}」的风险等级是「{product['risk_level']}」，"
+            f"高于您的风险偏好「{pref}」（最高可买「{allowed_max}」）。\n"
+            f"   适当性管理不允许向您销售超出偏好的产品；验码、确认都不能覆盖这一条。\n"
+            f"   如确需购买，请先到柜台/App 完成风险测评（本演示不提供在线改偏好的入口——"
+            f"偏好只能由测评写入，不能由对话改写）。",
+            "P-070",
+        )
+
     if args.amount_cents < product["min_amount_cents"]:
         return (
             f"「{product['name']}」的起购金额是 {product['min_amount_cents']} 分，"
@@ -176,5 +204,154 @@ register(
         precheck=_precheck_purchase,
         # 理财申购要求做过风险测评（KYC 2 级）；转账只要求实名（1 级）
         min_kyc=2,
+    )
+)
+
+
+# ------------------------------------------------------------------ 赎回
+#
+# ★ 分级：赎回是**黄色**（用户确认），不是红色——这是全项目唯一一处
+#   我们主动「不照抄赛题」的地方，理由写在 docs/权限分级规格.md §2.3：
+#   申购把钱锁进封闭期，风险方向是「拿不回来」；赎回是客户取回自有资金，
+#   方向相反。权责不对称的资金动作，分级也该不对称。
+#   （赛题原文只把「理财产品申购」列为红色，未提赎回。）
+
+class RedeemArgs(BaseModel):
+    product: str = Field(default="", max_length=32, description="产品名；留空表示赎回全部持仓")
+    amount_cents: int | None = Field(
+        default=None, gt=0, le=100_000_000, description="赎回金额（分）；留空表示该产品全部赎回"
+    )
+
+    @field_validator("amount_cents", mode="before")
+    @classmethod
+    def _normalize_amount(cls, v):
+        """模型会把「全部」原样塞进金额槽。
+
+        ★ 真机联调实测：用户说「赎回全部稳健增利」，模型填了
+          {"amount_cents": "全部"}，被 Schema 校验拒成 P-010「参数不合法」——
+          用户看到的是系统坏了，其实只是「全部」不是整数。
+          「全部赎回」在这个工具里本来就有合法表达（None），
+          所以这里把「全部/清仓/空串」归一成 None；其余把「1000元」这类
+          带单位的字符串归一成分，归一不了的原样交给校验报错，不编数。
+        """
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            if s in ("", "全部", "全赎回", "全赎", "不留", "清仓", "all", "ALL"):
+                return None
+            had_unit = any(u in s for u in ("元", "块"))
+            s2 = s.replace(",", "").replace("，", "")
+            for suffix in ("元", "块"):
+                s2 = s2.replace(suffix, "")
+            try:
+                num = float(s2)
+            except ValueError:
+                return v
+            if had_unit or "." in s2:
+                return int(round(num * 100))
+            return int(num)
+        return v
+
+
+def _precheck_redeem(conn: sqlite3.Connection, user_id: str, args: RedeemArgs) -> str | None:
+    """在用户点确认之前，先把「赎不回来」的情况说清楚。"""
+    from datetime import date, timedelta
+
+    orders = [o for o in list_wealth_orders(conn, user_id) if o["status"] == "executed"]
+    if args.product:
+        orders = [o for o in orders if args.product in o["product_name"]]
+    if not orders:
+        return "没有可赎回的持仓" + (f"（产品「{args.product}」）" if args.product else "")
+
+    today = date.today()
+    locked = []
+    for o in orders:
+        p = get_wealth_product(conn, o["product_id"])
+        lock_days = int(p["lock_days"] or 0) if p else 0
+        if lock_days and (today - date.fromisoformat(o["ts"][:10])).days < lock_days:
+            locked.append(o["product_name"])
+    if locked and len(locked) == len(orders):
+        return f"「{'、'.join(locked)}」仍在封闭期内，暂不可赎回"
+    return None
+
+
+def _redeem(conn: sqlite3.Connection, ctx: UserContext, args: RedeemArgs) -> ToolResult:
+    from datetime import date
+
+    orders = [o for o in list_wealth_orders(conn, ctx.user_id) if o["status"] == "executed"]
+    if args.product:
+        orders = [o for o in orders if args.product in o["product_name"]]
+    if not orders:
+        return ToolResult(ok=False, tool="redeem_wealth", error="没有可赎回的持仓")
+
+    acc = get_account(conn, ctx.user_id, "current")
+    if acc is None:
+        return ToolResult(ok=False, tool="redeem_wealth", error="活期账户异常")
+
+    budget = args.amount_cents  # None = 全部
+    redeemed: list[dict] = []
+    skipped: list[str] = []
+    for o in orders:
+        p = get_wealth_product(conn, o["product_id"])
+        lock_days = int(p["lock_days"] or 0) if p else 0
+        if lock_days and (date.today() - date.fromisoformat(o["ts"][:10])).days < lock_days:
+            skipped.append(o["product_name"])
+            continue
+        take = int(o["amount_cents"]) if budget is None else min(budget, int(o["amount_cents"]))
+        if take <= 0:
+            break
+        budget = None if budget is None else budget - take
+
+        if take == int(o["amount_cents"]):
+            conn.execute("UPDATE wealth_orders SET status='redeemed' WHERE id=?", (o["id"],))
+        else:
+            conn.execute(
+                "UPDATE wealth_orders SET amount_cents=amount_cents-? WHERE id=?",
+                (take, o["id"]),
+            )
+        conn.execute(
+            "INSERT INTO transactions(id,account_id,user_id,ts,direction,amount_cents,"
+            "counterparty,category,memo) VALUES (?,?,?,?,?,?,?,?,?)",
+            (new_id("t_"), acc["id"], ctx.user_id, now_iso(), "in", take,
+             o["product_name"], "理财", f"赎回 {o['product_name']}"),
+        )
+        redeemed.append({"product_name": o["product_name"], "amount_cents": take})
+
+    total = sum(x["amount_cents"] for x in redeemed)
+    if total <= 0:
+        return ToolResult(
+            ok=False, tool="redeem_wealth",
+            error=f"「{'、'.join(skipped)}」仍在封闭期内，暂不可赎回",
+        )
+
+    conn.execute(
+        "UPDATE accounts SET balance_cents = balance_cents + ? WHERE id=?", (total, acc["id"])
+    )
+    return ToolResult(
+        ok=True,
+        tool="redeem_wealth",
+        data={
+            "redeemed": redeemed,
+            "total_cents": total,
+            "balance_after_cents": int(acc["balance_cents"]) + total,
+            "skipped": skipped,
+        },
+    )
+
+
+register(
+    ToolMeta(
+        name="redeem_wealth",
+        label="理财赎回",
+        base_level=RiskLevel.YELLOW,
+        # ★ 明确声明它不是「向联系人转账」类操作：不占转账日额度（否则赎回反而让人转不出钱）
+        is_fund_movement=True,
+        args_model=RedeemArgs,
+        handler=_redeem,
+        description="赎回本人持仓的理财产品（封闭期内不可赎回），资金回到活期账户。",
+        precheck=_precheck_redeem,
+        min_kyc=1,
+        amount_optional=True,
     )
 )

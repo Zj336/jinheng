@@ -7,14 +7,18 @@
 ★ 为什么「取消订阅」只是黄色、而转账是黄色起步：
    赛题第 33 行明确把「订阅查询/取消」放在黄色。
    我们的判断依据不是照抄赛题，而是同一个判据——**能不能不可逆地动到钱**。
-   取消订阅只停掉未来的扣款，不产生即时资金变动，所以黄色；
-   一旦某个「订阅」其实是一次性大额代扣（见 detect_overcharge），
-   同一件事就会升级到红色。
+   取消订阅只停掉未来的扣款，不产生即时资金变动，所以黄色。
+
+★ 未实现、也如实标注的：订阅的**自动异常识别**（长期未使用仍在扣费、
+   扣款金额突增）。查询里已经给了「只看月扣款 ≥100 元」这个筛子，
+   但系统不会自己判定「这笔扣贵了」——那需要消费行为基线，目前没有。
+   所以这里不写「会自动升级到红色」：不存在的功能不该出现在文档里。
 """
 
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -38,6 +42,30 @@ def _query_subscriptions(
         rows = [r for r in rows if r["amount_cents"] >= 10_000]
     monthly = sum(r["amount_cents"] for r in rows if r["period"] == "monthly")
     yearly = sum(r["amount_cents"] for r in rows if r["period"] == "yearly")
+
+    # ★ 续费提醒是「拉取式」的：不问不推，问就把未来 7 天要扣的钱算清楚。
+    #   为什么不主动推：我们没有推送通道，也不该为了像样就给演示塞一个假的推送。
+    #   「未来 7 天将自动扣费 ¥X」——这句话用户才真正需要，因为它回答的是
+    #   「我这张卡下周会不会被扣穿」，而不是「我一共有几个会员」。
+    today = date.today()
+    upcoming: list[dict] = []
+    for r in rows:
+        try:
+            due = date.fromisoformat(str(r.get("next_charge_date") or ""))
+        except ValueError:
+            continue  # 日期缺失/格式不对就不猜，"下次扣款 —" 已经说明了
+        days_left = (due - today).days
+        if 0 <= days_left <= 7:
+            upcoming.append(
+                {
+                    "merchant": r["merchant"],
+                    "amount_cents": r["amount_cents"],
+                    "date": due.isoformat(),
+                    "days_left": days_left,
+                }
+            )
+    upcoming.sort(key=lambda x: (x["days_left"], -x["amount_cents"]))
+
     return ToolResult(
         ok=True,
         tool="query_subscriptions",
@@ -48,6 +76,8 @@ def _query_subscriptions(
             "yearly_total_cents": yearly,
             # 折算成年支出，方便用户直观感受「小钱变大钱」
             "annualized_cents": monthly * 12 + yearly,
+            "upcoming_7d": upcoming,
+            "upcoming_7d_cents": sum(x["amount_cents"] for x in upcoming),
         },
     )
 

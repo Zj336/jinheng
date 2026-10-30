@@ -136,14 +136,64 @@ def _render_analyze_spending(r: ToolResult) -> str:
     return f"分析完成（{goal}），但表述层没有对应的模板。" + tail
 
 
+def _render_adjust_card_limit(r: ToolResult) -> str:
+    if not r.ok:
+        return f"额度调整未完成：{r.error}"
+    d = r.data
+    direction = "上调" if d["raised"] else "下调"
+    return (
+        f"已将 {d['brand']}{d['kind_cn']}（尾号 {d['last4']}）的单日交易限额"
+        f"{direction}为 {yuan(d['new_limit_cents'])}（原 {yuan(d['old_limit_cents'])}）。"
+    )
+
+
+def _render_lock_card(r: ToolResult) -> str:
+    if not r.ok:
+        return f"交易限制未完成：{r.error}"
+    d = r.data
+    return (
+        f"已对 {d['brand']}{d['kind_cn']}（尾号 {d['last4']}）设置**交易限制**："
+        f"该卡不能再发生新的交易，但仍可查询。\n  {d.get('note', '')}"
+    )
+
+
+def _render_unlock_card(r: ToolResult) -> str:
+    if not r.ok:
+        return f"解除交易限制未完成：{r.error}"
+    d = r.data
+    return f"已解除 {d['brand']}{d['kind_cn']}（尾号 {d['last4']}）的交易限制，该卡恢复正常交易能力。"
+
+
+
+def _render_redeem_wealth(r: ToolResult) -> str:
+    if not r.ok:
+        return f"赎回未完成：{r.error}"
+    d = r.data
+    rows = "\n".join(
+        f"  · {x['product_name']}  {yuan(x['amount_cents'])}" for x in d["redeemed"]
+    )
+    tail = f"\n  （{'、'.join(d['skipped'])} 仍在封闭期内，未赎回。）" if d.get("skipped") else ""
+    return (
+        f"已赎回 {len(d['redeemed'])} 笔，合计 {yuan(d['total_cents'])}，"
+        f"资金已回到活期（余额 {yuan(d['balance_after_cents'])}）：\n{rows}{tail}"
+    )
+
+
 def _render_transfer(r: ToolResult) -> str:
     if not r.ok:
         return f"转账未完成：{r.error}"
     d = r.data
     if d.get("scheduled"):
+        used = d.get("scheduled_day_used_cents")
+        tail = (
+            f"\n该日已占用额度 {yuan(used)}。" if isinstance(used, int) else ""
+        )
         return (
-            f"已预约于 {d['schedule_date']} 向 {d['to_name']}"
-            f"（{d['to_bank']} {d['to_account_masked']}）转账 {yuan(d['amount_cents'])}。"
+            f"✅ 已登记预约：{d['schedule_date']} 向 {d['to_name']}"
+            f"（{d['to_bank']} {d['to_account_masked']}）转账 {yuan(d['amount_cents'])}。\n"
+            f"**这笔钱现在没有扣**，将在执行日从账户扣款；该日额度已为它预扣。"
+            f"{tail}\n"
+            f"（演示环境未开启调度器，预约只登记不执行；恢复方式见 README。）"
         )
     memo = f"，备注「{d['memo']}」" if d.get("memo") else ""
     return (
@@ -170,7 +220,23 @@ def _render_query_subscriptions(r: ToolResult) -> str:
         f"  下次扣款 {i['next_charge_date'] or '—'}"
         for i in items
     ]
-    return head + "\n" + "\n".join(lines)
+    text = head + "\n" + "\n".join(lines)
+
+    # 续费提醒：只报「未来 7 天真的要扣的钱」。
+    # 没有就不写——不制造「本周一切安好」这种系统其实并不知道的结论。
+    soon = d.get("upcoming_7d") or []
+    if soon:
+        detail = "、".join(
+            f"{x['merchant']} {x['date'][5:]} {yuan(x['amount_cents'])}"
+            + ("（今天）" if x["days_left"] == 0 else f"（还有 {x['days_left']} 天）")
+            for x in soon
+        )
+        text += (
+            f"\n\n⏰ 未来 7 天将自动扣费 {yuan(d['upcoming_7d_cents'])}"
+            f"（{len(soon)} 笔）：{detail}。"
+            f"\n   不想被扣的话，现在就可以说「取消 X 的订阅」。"
+        )
+    return text
 
 
 def _render_cancel_subscription(r: ToolResult) -> str:
@@ -289,6 +355,10 @@ _RENDERERS = {
     "unfreeze_card": _render_unfreeze_card,
     "query_wealth_products": _render_query_wealth_products,
     "purchase_wealth": _render_purchase_wealth,
+    "redeem_wealth": _render_redeem_wealth,
+    "adjust_card_limit": _render_adjust_card_limit,
+    "lock_card_transactions": _render_lock_card,
+    "unlock_card_transactions": _render_unlock_card,
 }
 
 
@@ -368,6 +438,19 @@ def render_pending(decisions: list[Decision], steps, masked_phone: str | None = 
             lines.append(
                 f"🔐 以下操作属于大额/高风险，需要多重身份验证：\n{card}\n  （{d.reason}）{hint}"
             )
+
+        # ★ 把「这一步之后还有哪些步骤」明明白白列出来。
+        #   `steps` 是按计划顺序切出来的剩余步骤（含前置查询），从当前这一步往后
+        #   切片即可。不列的话，用户只看见一张卡片，却以为整件事就是卡片上那点钱——
+        #   而一次确认只放行它上面那一步，剩下的必须各自再确认。
+        pos = next((i for i, s in enumerate(steps) if s.id == d.step_id), None)
+        after = steps[pos + 1:] if pos is not None else []
+        if after:
+            lines.append(
+                "  📋 本计划还有以下步骤（**每次确认只放行上面那一步**，"
+                "其余会在轮到它们时单独再确认）：\n"
+                + "\n".join(f"     · {_describe_step(s)}" for s in after)
+            )
     return "\n\n".join(lines)
 
 
@@ -402,6 +485,24 @@ def _describe_step(step) -> str:
         return f"挂失卡片「{args.get('card')}」（该卡将被立即阻断交易）"
     if step.tool == "unfreeze_card":
         return f"解除卡片「{args.get('card')}」的挂失（该卡将恢复交易能力）"
+    if step.tool == "redeem_wealth":
+        # 模型会把「全部」原样塞进金额槽（原样字符串，未经 Schema 归一），
+        # 表述层不能拿它直接做数值运算，否则就是一次 500。
+        amt = args.get("amount_cents")
+        if isinstance(amt, (int, float)) and amt > 0:
+            money = f" {yuan(int(amt))}"
+        else:
+            money = "（全部）"
+        return f"赎回「{args.get('product') or '全部持仓'}」{money}"
     if step.tool == "purchase_wealth":
         return f"申购「{args.get('product')}」{yuan(args.get('amount_cents', 0))}"
+    if step.tool == "adjust_card_limit":
+        return (
+            f"把卡片「{args.get('card')}」的单日交易限额调整为 "
+            f"{yuan(args.get('new_daily_limit_cents', 0))}"
+        )
+    if step.tool == "lock_card_transactions":
+        return f"对卡片「{args.get('card')}」设置**交易限制**（卡不会被挂失）"
+    if step.tool == "unlock_card_transactions":
+        return f"解除卡片「{args.get('card')}」的交易限制"
     return f"{step.tool} {args}"

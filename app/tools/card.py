@@ -250,3 +250,141 @@ register(
         precheck=lambda c, u, a: _precheck_card(c, u, a, want_frozen=False),
     )
 )
+
+
+# ------------------------------------------------------------------ 额度调整
+
+LOCKED = "locked"      # 交易限制（可查询，不可交易）
+
+
+class AdjustLimitArgs(BaseModel):
+    card: str = Field(min_length=1, max_length=32, description="卡号后四位或卡种")
+    new_daily_limit_cents: int = Field(ge=0, le=5_000_000, description="新的单日交易限额（分）")
+
+
+def _adjust_card_limit(
+    conn: sqlite3.Connection, ctx: UserContext, args: AdjustLimitArgs
+) -> ToolResult:
+    card, err = _resolve(conn, ctx.user_id, args.card)
+    if err or card is None:
+        return ToolResult(ok=False, tool="adjust_card_limit", error=err or "卡片解析失败")
+    if card["kind"] == "credit" and args.new_daily_limit_cents > 5_000_000:
+        return ToolResult(ok=False, tool="adjust_card_limit", error="超过本行单卡额度上限")
+
+    old = int(card["daily_limit_cents"] or 0)
+    conn.execute(
+        "UPDATE cards SET daily_limit_cents=? WHERE id=? AND user_id=?",
+        (args.new_daily_limit_cents, card["id"], ctx.user_id),
+    )
+    return ToolResult(
+        ok=True,
+        tool="adjust_card_limit",
+        data={
+            "last4": card["last4"],
+            "brand": card["brand"],
+            "kind_cn": CARD_KIND_CN.get(card["kind"], card["kind"]),
+            "old_limit_cents": old,
+            "new_limit_cents": args.new_daily_limit_cents,
+            "raised": args.new_daily_limit_cents > old,
+        },
+    )
+
+
+register(
+    ToolMeta(
+        name="adjust_card_limit",
+        label="调整卡片限额",
+        # ★ 与「赎回按黄色」相反的方向：调额是**抬高**风险暴露。
+        #   即便调低也要发码，因为账户被盗后第一件事通常就是把额度改掉，
+        #   再用来大额套现或洗钱。权责不对称的资金动作，分级也必须不对称。
+        base_level=RiskLevel.RED,
+        is_fund_movement=False,
+        args_model=AdjustLimitArgs,
+        handler=_adjust_card_limit,
+        description="调整本人某张卡的单日交易限额（需强验证）。",
+        min_kyc=1,
+    )
+)
+
+
+# ------------------------------------------------------------------ 交易限制 / 解锁
+
+class LockCardArgs(BaseModel):
+    card: str = Field(min_length=1, max_length=32)
+    reason: str = Field(default="", max_length=64)
+
+
+def _lock_card_transactions(
+    conn: sqlite3.Connection, ctx: UserContext, args: LockCardArgs
+) -> ToolResult:
+    card, err = _resolve(conn, ctx.user_id, args.card)
+    if err or card is None:
+        return ToolResult(ok=False, tool="lock_card_transactions", error=err or "卡片解析失败")
+    set_card_status(conn, ctx.user_id, card["id"], LOCKED, args.reason or "用户主动限制交易")
+    return ToolResult(
+        ok=True,
+        tool="lock_card_transactions",
+        data={
+            "last4": card["last4"],
+            "brand": card["brand"],
+            "kind_cn": CARD_KIND_CN.get(card["kind"], card["kind"]),
+            "status": LOCKED,
+            "reason": args.reason or "用户主动限制交易",
+            "note": "卡未被挂失：仍可查询、可解挂/解锁，但不能发生新的交易。",
+        },
+    )
+
+
+def _unlock_card_transactions(
+    conn: sqlite3.Connection, ctx: UserContext, args: UnfreezeArgs
+) -> ToolResult:
+    card, err = _resolve(conn, ctx.user_id, args.card)
+    if err or card is None:
+        return ToolResult(ok=False, tool="unlock_card_transactions", error=err or "卡片解析失败")
+    if card["status"] == FROZEN:
+        # ★ 已挂失的卡不能被「解锁交易」顺手复活——那等于绕过解挂的强验证。
+        return ToolResult(
+            ok=False,
+            tool="unlock_card_transactions",
+            error="该卡已挂失，只能走「解挂」流程（强验证），不能用解锁交易恢复。",
+        )
+    set_card_status(conn, ctx.user_id, card["id"], ACTIVE, None)
+    return ToolResult(
+        ok=True,
+        tool="unlock_card_transactions",
+        data={
+            "last4": card["last4"],
+            "brand": card["brand"],
+            "kind_cn": CARD_KIND_CN.get(card["kind"], card["kind"]),
+            "status": ACTIVE,
+        },
+    )
+
+
+register(
+    ToolMeta(
+        name="lock_card_transactions",
+        label="限制卡片交易",
+        # 收紧风险暴露 → 黄色
+        base_level=RiskLevel.YELLOW,
+        is_fund_movement=False,
+        args_model=LockCardArgs,
+        handler=_lock_card_transactions,
+        description="冻结某张卡的**交易**（卡仍存在、可查询），用于可疑场景下的自救。",
+        min_kyc=1,
+    )
+)
+
+register(
+    ToolMeta(
+        name="unlock_card_transactions",
+        label="解除交易限制",
+        # 放宽风险暴露 → 红色（与解挂同一原则）
+        base_level=RiskLevel.RED,
+        is_fund_movement=False,
+        args_model=UnfreezeArgs,
+        handler=_unlock_card_transactions,
+        description="解除某张卡的交易限制（需强验证）。已挂失的卡不能走这条路。",
+        min_kyc=1,
+    )
+)

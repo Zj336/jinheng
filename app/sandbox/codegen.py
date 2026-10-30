@@ -238,8 +238,22 @@ def validate_result(goal: str, result, items: list[dict]) -> str | None:
         if out_items and int(result.get("total_cents") or 0) <= 0:
             return "输入有支出，结果合计却为 0"
         key = {"category_breakdown": "category", "top_merchants": "merchant", "trend": "week"}[goal]
-        if rows and key not in rows[0]:
-            return f"rows 里缺少 {key} 字段"
+        # ★ 逐行校验，不能只看第一行。修之前只查 rows[0]：
+        #   第二行若缺 cents/pct_bp，校验放行，表述层取值时 KeyError → 500，
+        #   而且「回落确定性模板」这条兜底根本没机会触发。
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                return f"rows 第 {idx + 1} 项不是对象"
+            if key not in row:
+                return f"rows 第 {idx + 1} 项缺少 {key} 字段"
+            if "cents" not in row:
+                return f"rows 第 {idx + 1} 项缺少 cents 字段"
+            if goal in ("category_breakdown", "top_merchants") and "pct_bp" not in row:
+                return f"rows 第 {idx + 1} 项缺少 pct_bp 字段"
+            # 下钻明细（top）是表述层第三个直接下标取值的地方，同样要逐项校验
+            for t in (row.get("top") or []):
+                if not isinstance(t, dict) or "merchant" not in t or "cents" not in t:
+                    return f"rows 第 {idx + 1} 项的 top 明细格式不对（需要 merchant/cents）"
         # ★ 笔数也必须对得上。实测过的第二种「安静地答错」：
         #   模型把 count 填成了**类目数**（5），而表述层把它读成「共 5 笔支出」，
         #   合计又是对的——用户看到「近 30 天共 5 笔支出，合计 ¥10,912.00」，
@@ -263,6 +277,12 @@ def validate_result(goal: str, result, items: list[dict]) -> str | None:
         rows = need_list("rows")
         if rows is None:
             return "rows 不是列表"
+        # ★ 表述层对这四列做直接下标取值，缺一个就是 KeyError → 500。
+        #   这里逐行挡住，让「回落确定性模板」有机会发生。
+        for idx, row in enumerate(rows):
+            for k in ("ts", "counterparty", "cents", "reasons"):
+                if not isinstance(row, dict) or k not in row:
+                    return f"rows 第 {idx + 1} 项缺少 {k} 字段"
         if out_items and need_int("scanned") and result["scanned"] < len(out_items):
             return f"只扫描了 {result['scanned']} 笔，输入实际有 {len(out_items)} 笔支出"
 

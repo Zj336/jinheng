@@ -51,6 +51,33 @@ def test_identity_comes_from_the_token_not_the_body():
         assert r2.status_code == 403
 
 
+def test_cannot_hijack_another_users_session():
+    """★ 修之前的真实越权：`session_id` 在响应体、前端状态、审计导出里都是明文。
+
+    拿自己的令牌 + 别人的 session_id，`get_or_create` 会直接返回**对方**的上下文，
+    后续裁决、执行、审计全部按对方身份跑（读对方的卡、用对方挂着的验证码、
+    从对方账户扣钱）。现在归属不符一律 404 —— 不是 403，403 等于承认它存在。
+    """
+    with TestClient(app) as client:
+        mine = _login(client, OWNER, "123456")
+        r = client.post("/api/chat", json={"message": "我有哪些卡"}, headers=mine)
+        victim_sid = r.json()["session_id"]
+        assert victim_sid
+
+        theirs = _login(client, OTHER, "654321")
+        r2 = client.post(
+            "/api/chat", json={"session_id": victim_sid, "message": "我有哪些卡"}, headers=theirs
+        )
+        assert r2.status_code == 404
+        assert "招商银行" not in r2.text
+
+        # 全新 id 仍应正常开新会话（不能把「没见过」也判成越权）
+        r3 = client.post(
+            "/api/chat", json={"session_id": "s_brand_new_0001", "message": "我有哪些卡"}, headers=theirs
+        )
+        assert r3.status_code == 200
+
+
 def test_wrong_pin_is_rejected_and_does_not_leak_existence():
     with TestClient(app) as client:
         a = client.post("/api/auth/login", json={"user_id": OWNER, "pin": "000000"})

@@ -23,6 +23,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+# ★ 自检自己也要说人话。
+#   `python selfcheck.py` 的 stdout 在 Windows 上跟着控制台代码页走（cp936），
+#   而本文件满屏中文，于是「三项全 PASS」却被打印成 `��� Statera �� һ���Լ�`。
+#   崩溃还能读堆栈，乱码连猜都难——评审第一眼看到的就是它。
+#   reconfigure 只改编码不改行为；旧解释器没有该方法时静默跳过，
+#   errors="replace" 保证这里永远不会反过来把自检搞挂。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
 # ★ 必须显式让子进程也用 UTF-8 输出。
 #   我们自己按 utf-8 解码子进程的输出，但子进程的 stdout 一旦是管道，
 #   Windows 上就会退回系统本地编码（cp936）——⏎ ✓ 这类字符根本编码不了，

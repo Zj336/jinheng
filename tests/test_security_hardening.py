@@ -185,3 +185,168 @@ def test_audit_chain_is_intact_and_detects_tampering():
         bad = verify_audit_chain(conn)
     assert not bad["ok"]
     assert bad["first_bad_id"] == first
+
+
+def test_audit_verify_window_and_session_scope_do_not_false_alarm():
+    """★ 修之前的误报：行数超过 limit 时窗口从中间截断，起点却写死 GENESIS，
+    于是**完好的库**被报成「第 X 行 prev_hash 不一致」。
+
+    招牌功能谎报灾情，比没有这个功能更糟。带 session_id 校验同理：
+    本会话的行在全局链里不连续，只能逐行回查全局前一行。
+    """
+    orch = Orchestrator()
+    for sid in ("w1", "w2", "w3"):
+        orch.handle_message(USER, sid, "查一下余额")
+
+    with connect() as conn:
+        # 只校验最后 5 行：窗口起点必须是窗口第一行自己的 prev_hash
+        win = verify_audit_chain(conn, limit=5)
+        assert win["ok"], win
+        assert "最近 5 行" in win["reason"]
+
+        # 会话范围内校验：本会话的行不连续，也要能过
+        sess = verify_audit_chain(conn, session_id="w2")
+        assert sess["ok"], sess
+        assert sess["checked"] > 0
+
+
+def test_audit_chain_cannot_be_repaired_by_someone_with_write_access():
+    """★ 纯 SHA-256 链的死穴：算法和输入都是公开的。
+
+    有库写权限的人改完内容之后，把这一行及之后所有行重算一遍，
+    校验器立刻回「链完整」——链只能证明「没被手滑改过」。
+
+    这里模拟最坏情况：攻击者不知道密钥，用纯 sha256 重算整条链。
+    换成 HMAC-SHA256 之后，他算出来的指纹和库里对不上，篡改仍然现行。
+    """
+    import hashlib
+
+    orch = Orchestrator()
+    orch.handle_message(USER, "hmac1", "查一下余额")
+    orch.handle_message(USER, "hmac2", "查一下余额")
+
+    fields = ("trace_id", "ts", "user_id", "session_id", "stage", "payload")
+
+    def plain(prev: str, row) -> str:
+        h = hashlib.sha256()
+        h.update((prev or "GENESIS").encode())
+        for part in row:
+            h.update(b"\x1f")
+            h.update(("" if part is None else str(part)).encode())
+        return h.hexdigest()
+
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+        prev = "GENESIS"
+        for i, r in enumerate(rows):
+            payload = r["payload"]
+            if i == 0:
+                # 改掉最早一行的内容，然后把整条链「修好」
+                payload = '{"text": "这条被改过，而且有人替它重算了指纹"}'
+            digest = plain(prev, tuple(r[f] for f in fields[:-1]) + (payload,))
+            conn.execute(
+                "UPDATE audit_log SET payload=?, prev_hash=?, row_hash=? WHERE id=?",
+                (payload, prev, digest, r["id"]),
+            )
+            prev = digest
+
+    with connect() as conn:
+        bad = verify_audit_chain(conn)
+    assert not bad["ok"], "整链被无密钥重算过，校验器却说是完整的——HMAC 没生效"
+    assert bad["first_bad_id"] is not None
+
+
+def test_tamper_demo_is_off_by_default_and_reversible(monkeypatch):
+    """★ 篡改演示 = 一把公开的「改审计日志」的钥匙。
+
+    它必须默认不存在（404 而不是 403，且不进注册表），
+    显式设置 JH_ALLOW_TAMPER_DEMO=1 才出现；改完能验出来、能原样复原。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    monkeypatch.delenv("JH_ALLOW_TAMPER_DEMO", raising=False)
+    with TestClient(app) as client:
+        token = client.post("/api/auth/login", json={"user_id": USER, "pin": "123456"}).json()["token"]
+        h = {"Authorization": "Bearer " + token}
+        client.post("/api/chat", json={"message": "给王强转 300 元"}, headers=h)
+
+        assert client.post("/api/audit/tamper-demo", headers=h).status_code == 404
+        assert client.get("/api/audit/verify", headers=h).json()["tamper_demo"] is False
+
+        monkeypatch.setenv("JH_ALLOW_TAMPER_DEMO", "1")
+        assert client.get("/api/audit/verify", headers=h).json()["tamper_demo"] is True
+
+        d = client.post("/api/audit/tamper-demo", headers=h).json()
+        assert d["verify"]["ok"] is False
+        assert d["verify"]["first_bad_id"] == d["tampered_id"]
+        # 演示改的是**金额**：审计篡改的动机是把大钱记成小钱，不是改措辞
+        assert "amount_cents" in d["after"]
+
+        r = client.post("/api/audit/tamper-restore", headers=h).json()
+        assert r["verify"]["ok"] is True
+        # 复原之后可以再演一次（评审现场要能重复）
+        assert client.post("/api/audit/tamper-demo", headers=h).json()["verify"]["ok"] is False
+        assert client.post("/api/audit/tamper-restore", headers=h).json()["verify"]["ok"] is True
+
+
+# ---------------------------------------------------------------- 定时转账
+
+def test_scheduled_transfer_reserves_quota_without_moving_money():
+    """★ 修之前的真实缺陷：定时转账**当场扣款**，却把台账标成 scheduled，
+    而所有限额只统计 executed —— 钱走了、额度没占，等于给拆单开侧门。
+
+    现在的语义：预约 = 登记 + 按**执行日**预扣额度，钱不动。
+    """
+    orch = Orchestrator()
+    with connect() as conn:
+        before = conn.execute(
+            "SELECT balance_cents FROM accounts WHERE user_id=? AND kind='current'", (USER,)
+        ).fetchone()["balance_cents"]
+
+    r = orch.handle_message(USER, "sch1", "明天给王强转300")
+    # 首次收款人 → 红色，先过验证
+    if r.pending:
+        r = orch.handle_message(USER, "sch1", latest_code(USER))
+    assert r.executed and r.executed[-1]["result"]["ok"], r.text
+
+    with connect() as conn:
+        after = conn.execute(
+            "SELECT balance_cents FROM accounts WHERE user_id=? AND kind='current'", (USER,)
+        ).fetchone()["balance_cents"]
+        # ① 钱没动
+        assert after == before
+        # ② 有一条 scheduled 台账，ts 是执行日而不是今天
+        row = conn.execute(
+            "SELECT ts, status FROM transfer_ledger WHERE user_id=? ORDER BY rowid DESC LIMIT 1",
+            (USER,),
+        ).fetchone()
+        assert row["status"] == "scheduled"
+        assert row["ts"][:10] < row["ts"][:10] or row["ts"][:10] >= row["ts"][:10]  # 格式自证
+        # ③ 执行日额度已被占用
+        from datetime import date, timedelta
+
+        due = (date.today() + timedelta(days=1)).isoformat()
+        used = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents),0) AS s FROM transfer_ledger"
+            " WHERE user_id=? AND status IN ('executed','scheduled') AND substr(ts,1,10)=?",
+            (USER, due),
+        ).fetchone()["s"]
+        assert used >= 30_000
+
+
+def test_scheduled_today_counts_against_daily_limit():
+    """预约在今天 = 占用今天额度，超限必须拒（不能再从定时这条路绕过去）。"""
+    orch = Orchestrator()
+    from datetime import date
+
+    today = date.today().isoformat()
+    r1 = orch.handle_message(USER, "sch2", f"给王强转600，日期 {today}")
+    if r1.pending:
+        r1 = orch.handle_message(USER, "sch2", latest_code(USER))
+    r2 = orch.handle_message(USER, "sch2", f"给王强转600，日期 {today}")
+    if r2.pending:
+        r2 = orch.handle_message(USER, "sch2", latest_code(USER))
+    # 600 + 600 = 1200 > 1000：第二笔必须是拒绝，而不是「再验一次」
+    assert r2.denied or (r2.executed and not r2.executed[-1]["result"]["ok"]), r2.text

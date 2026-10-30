@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
@@ -195,7 +198,11 @@ def chat(body: ChatIn, authorization: str | None = Header(default=None)) -> Chat
         raise HTTPException(
             403, "身份以令牌为准：不需要、也不允许在请求体里指定其他用户。"
         )
-    r = _orchestrator.handle_message(uid, body.session_id, body.message)
+    try:
+        r = _orchestrator.handle_message(uid, body.session_id, body.message)
+    except session.SessionOwnershipError:
+        # 别人的会话 → 一律 404。403 等于承认「这个会话存在，只是不给你」。
+        raise HTTPException(404, "会话不存在。请重新发起对话。")
     return ChatOut(
         session_id=r.session_id, text=r.text, trace_id=r.trace_id,
         executed=r.executed, denied=r.denied, pending=r.pending,
@@ -218,7 +225,117 @@ def audit_verify(authorization: str | None = Header(default=None)) -> dict:
     with connect() as conn:
         result = verify_audit_chain(conn)
         result["total_rows"] = conn.execute("SELECT COUNT(*) AS c FROM audit_log").fetchone()["c"]
+    result["tamper_demo"] = _tamper_demo_enabled()
     return result
+
+
+# ---------------------------------------------------------- 篡改演示（默认关闭）
+#
+# ★ 为什么写一个「帮你改坏数据」的接口：
+#   哈希链的宣传语是「改一行就能被抓到」。但评审看不到这件事——他们只会看到
+#   一个绿色的 `ok: true`，而绿色在演示里是最不稀奇的东西。
+#   现场按一个键：改掉一条真实审计记录的金额 → 校验器立刻报出「第 N 行被改过」，
+#   再按一次恢复。这是把「口号」变成「可复现实验」的最短路径。
+#
+# ★ 为什么默认关闭、且关闭时返回 404：
+#   它是一把公开的「改审计日志」的钥匙。默认开着的系统，等于给了所有人
+#   一个篡改审计的入口——那正是本项目要反对的东西。所以要显式设置
+#   JH_ALLOW_TAMPER_DEMO=1 才存在；没开时连「有这么个接口」都不承认（404 而非 403）。
+
+def _tamper_demo_enabled() -> bool:
+    return os.getenv("JH_ALLOW_TAMPER_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _require_tamper_demo() -> None:
+    if not _tamper_demo_enabled():
+        raise HTTPException(404, "Not Found")
+
+
+@router.post("/audit/tamper-demo", tags=["审计"])
+def audit_tamper_demo(authorization: str | None = Header(default=None)) -> dict:
+    """把**当前用户自己**最近一条审计记录的金额改大 100 倍，然后立刻校验。
+
+    ★ 只动自己的行：演示不该顺手改坏别人的审计链。找不到自己的行就明确要求先做一次操作。
+    ★ 被改的原文会存进 app_meta，`/audit/tamper-restore` 用它原样写回——
+      恢复之后链重新完整，演示可以反复做。
+    """
+    _require_tamper_demo()
+    uid = current_user(authorization)
+    AMOUNT_KEYS = ("amount_cents", "total_cents", "balance_after_cents")
+    with connect() as conn:
+        # 优先挑一条**带金额**的记录：审计篡改真实的作案动机是把大钱记成小钱，
+        # 改一句文案不足以说明问题。往前翻 30 行找，找不到再退回最后一行。
+        candidates = conn.execute(
+            "SELECT id, payload FROM audit_log WHERE user_id=? ORDER BY id DESC LIMIT 30", (uid,)
+        ).fetchall()
+        if not candidates:
+            raise HTTPException(400, "当前账号还没有审计记录。先做一次操作（比如查余额）再来演示。")
+        row, original, data = None, "", {}
+        for cand in candidates:
+            try:
+                parsed = json.loads(cand["payload"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            # ★ 金额不一定在顶层：裁决记录的金额在 facts.amount_cents 里，
+            #   只翻顶层的话永远挑到「查余额」这种没有金额的行，演示就成了改文案。
+            for holder in (parsed, parsed.get("facts")):
+                if not isinstance(holder, dict):
+                    continue
+                hit = next(
+                    (k for k in AMOUNT_KEYS
+                     if isinstance(holder.get(k), int) and not isinstance(holder.get(k), bool)),
+                    None,
+                )
+                if hit:
+                    row, original, data = cand, cand["payload"], parsed
+                    holder[hit] = holder[hit] * 100
+                    break
+            if row is not None:
+                break
+        if row is None:
+            row = candidates[0]
+            original = row["payload"]
+            try:
+                data = json.loads(original)
+            except (TypeError, ValueError):
+                data = {"value": original}
+            if not isinstance(data, dict):
+                data = {"value": data}
+            data["_tampered_demo"] = True
+        tampered = json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+        conn.execute("UPDATE audit_log SET payload=? WHERE id=?", (tampered, row["id"]))
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(k,v) VALUES('tamper_demo_backup',?)",
+            (json.dumps({"id": row["id"], "payload": original}, ensure_ascii=False),),
+        )
+        result = verify_audit_chain(conn)
+    return {
+        "tampered_id": row["id"],
+        "before": original[:300],
+        "after": tampered[:300],
+        "verify": result,
+    }
+
+
+@router.post("/audit/tamper-restore", tags=["审计"])
+def audit_tamper_restore(authorization: str | None = Header(default=None)) -> dict:
+    """把上一步改掉的审计记录原样写回，链随之复原（可以反复演示）。"""
+    _require_tamper_demo()
+    current_user(authorization)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT v FROM app_meta WHERE k='tamper_demo_backup'"
+        ).fetchone()
+        if row is None:
+            raise HTTPException(400, "没有待恢复的篡改记录。先点一次「篡改演示」。")
+        backup = json.loads(row["v"])
+        conn.execute("UPDATE audit_log SET payload=? WHERE id=?", (backup["payload"], backup["id"]))
+        conn.execute("DELETE FROM app_meta WHERE k='tamper_demo_backup'")
+        result = verify_audit_chain(conn)
+    return {"restored_id": backup["id"], "verify": result}
 
 
 @router.get("/audit/{trace_id}", tags=["审计"])

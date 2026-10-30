@@ -129,8 +129,31 @@ def test_verified_factor_is_one_shot():
     engine = PolicyEngine()
     plan = _plan(Step(id="s1", tool="transfer", args={"to": "王强", "amount_cents": 30_000}))
     with connect() as conn:
-        allowed = engine.adjudicate_plan(conn, plan, _ctx(verified_factors=["mfa"]))[0]
+        # 凭证必须写明它放行的是哪一步（verified_for_step）
+        allowed = engine.adjudicate_plan(
+            conn, plan, _ctx(verified_factors=["mfa"], verified_for_step="s1")
+        )[0]
         # 凭证被消费后（orchestrator 会清空），同样的计划又需要验证
         again = engine.adjudicate_plan(conn, plan, _ctx())[0]
     assert allowed.outcome == DecisionOutcome.ALLOW
     assert again.outcome == DecisionOutcome.MFA
+
+
+def test_verified_factor_does_not_leak_to_other_steps():
+    """★ 一次确认只授权一步：同计划里**另一**步不能蹭到这张票。
+
+    修之前的真实事故：用户只看到「转 300」的卡片，回「确认」后，
+    计划里第二笔 300 被 P-061 自动放行 → 实际转出 600，而卡片上只写了 300。
+    """
+    engine = PolicyEngine()
+    plan = _plan(
+        Step(id="s1", tool="transfer", args={"to": "王强", "amount_cents": 30_000}),
+        Step(id="s2", tool="transfer", args={"to": "王强", "amount_cents": 30_000}),
+    )
+    with connect() as conn:
+        d1, d2 = engine.adjudicate_plan(
+            conn, plan, _ctx(verified_factors=["mfa"], verified_for_step="s1")
+        )
+    assert d1.outcome == DecisionOutcome.ALLOW
+    assert d2.outcome == DecisionOutcome.MFA
+    assert "P-062" not in d2.policy_hits

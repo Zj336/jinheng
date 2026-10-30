@@ -52,13 +52,17 @@ def seed(reset: bool = True, quiet: bool = False) -> None:
     uid = "u_1001"
     with connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO users(id,name,phone,kyc_level,created_at) VALUES (?,?,?,?,?)",
-            (uid, "李明", "13800138000", 2, now_iso()),
+            "INSERT OR REPLACE INTO users(id,name,phone,kyc_level,risk_pref,created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            # 风险偏好「稳健」→ 只能买「低」风险产品：演示里申购「平衡优选180天」（中）
+            # 会被 P-070 硬拒，而且**验码也过不去**，这是设计好的对照。
+            (uid, "李明", "13800138000", 2, "稳健", now_iso()),
         )
         # 第二个用户：用于验证「跨用户联系人隔离」，防止越权转账
         conn.execute(
-            "INSERT OR REPLACE INTO users(id,name,phone,kyc_level,created_at) VALUES (?,?,?,?,?)",
-            ("u_2001", "张伟", "13500135000", 2, now_iso()),
+            "INSERT OR REPLACE INTO users(id,name,phone,kyc_level,risk_pref,created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            ("u_2001", "张伟", "13500135000", 2, "进取", now_iso()),
         )
         conn.execute(
             "INSERT OR REPLACE INTO contacts(id,user_id,name,phone,account_no,bank,aliases,created_at)"
@@ -124,7 +128,9 @@ def seed(reset: bool = True, quiet: bool = False) -> None:
             "next_charge_date,status) VALUES (?,?,?,?,?,?,?)",
             [
                 ("s_iqiyi", uid, "爱奇艺", 9900, "monthly", _ts(-8).split("T")[0], "active"),
-                ("s_netease", uid, "网易云音乐", 800, "monthly", _ts(-13).split("T")[0], "active"),
+                # ★ 网易云音乐故意排在「明天」：查询订阅时会带出
+                #   「未来 7 天将自动扣费」那一段，否则这条续费提醒在演示当天看不见。
+                ("s_netease", uid, "网易云音乐", 800, "monthly", _ts(-1).split("T")[0], "active"),
                 ("s_icloud", uid, "iCloud 存储", 600, "monthly", _ts(-5).split("T")[0], "active"),
                 ("s_gym", uid, "超级猩猩健身", 29900, "monthly", _ts(-21).split("T")[0], "active"),
             ],

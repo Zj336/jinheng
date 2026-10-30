@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 
 from pydantic import BaseModel, Field
 
@@ -63,40 +64,58 @@ def _transfer(conn: sqlite3.Connection, ctx: UserContext, args: TransferArgs) ->
         return ToolResult(ok=False, tool="transfer", error="余额不足")
 
     scheduled = args.schedule_date is not None
-    ledger_status = "scheduled" if scheduled else "executed"
 
-    conn.execute(
-        "UPDATE accounts SET balance_cents = balance_cents - ? WHERE id=?",
-        (args.amount_cents, acc["id"]),
-    )
-    conn.execute(
-        "INSERT INTO transactions(id,account_id,user_id,ts,direction,amount_cents,"
-        "counterparty,category,memo) VALUES (?,?,?,?,?,?,?,?,?)",
-        (
-            new_id("t_"),
-            acc["id"],
-            ctx.user_id,
-            now_iso(),
-            "out",
-            args.amount_cents,
-            contact["name"],
-            "转账",
-            args.memo or ("定时转账" if scheduled else "转账"),
-        ),
-    )
+    # ★ 定时转账 = 预约，不是「现在扣钱、以后到账」。
+    #   修之前：`scheduled` 只改了台账的一个状态字段，余额当场扣掉、
+    #   流水按 now 落库、台账 status='scheduled'，而所有限额只统计 'executed'
+    #   ——钱已经走了却不占额度，相当于给拆单规避开了一扇侧门。
+    #   现在：预约**不动钱、不写交易流水**，只登记一条 status='scheduled' 的台账，
+    #   并把它的 ts 记成**执行日**，于是它占用的是执行日那一天（当月也照算）的额度。
+    if scheduled:
+        try:
+            due = date.fromisoformat(args.schedule_date or "")
+        except ValueError:
+            return ToolResult(ok=False, tool="transfer", error="预约日期格式应为 YYYY-MM-DD")
+        if due < date.today():
+            return ToolResult(ok=False, tool="transfer", error="预约日期不能早于今天")
+        ledger_ts = f"{due.isoformat()}T00:00:00"
+        ledger_status = "scheduled"
+    else:
+        ledger_ts = now_iso()
+        ledger_status = "executed"
+        conn.execute(
+            "UPDATE accounts SET balance_cents = balance_cents - ? WHERE id=?",
+            (args.amount_cents, acc["id"]),
+        )
+        conn.execute(
+            "INSERT INTO transactions(id,account_id,user_id,ts,direction,amount_cents,"
+            "counterparty,category,memo) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                new_id("t_"),
+                acc["id"],
+                ctx.user_id,
+                now_iso(),
+                "out",
+                args.amount_cents,
+                contact["name"],
+                "转账",
+                args.memo or "转账",
+            ),
+        )
+
     conn.execute(
         "INSERT INTO transfer_ledger(id,user_id,ts,amount_cents,contact_id,counterparty,"
         "status,decision_level,trace_id) VALUES (?,?,?,?,?,?,?,?,?)",
         (
             new_id("l_"),
             ctx.user_id,
-            now_iso(),
+            ledger_ts,
             args.amount_cents,
             contact["id"],
             contact["name"],
             ledger_status,
             "",
-            "",
+            ctx.trace_id,
         ),
     )
 
@@ -112,6 +131,10 @@ def _transfer(conn: sqlite3.Connection, ctx: UserContext, args: TransferArgs) ->
             "scheduled": scheduled,
             "schedule_date": args.schedule_date,
             "daily_total_after_cents": daily_transferred_cents(conn, ctx.user_id),
+            # 预约日对应的已占用额度（含本条），让用户看得见「那天还剩多少」
+            "scheduled_day_used_cents": daily_transferred_cents(
+                conn, ctx.user_id, args.schedule_date
+            ) if scheduled else None,
         },
     )
 

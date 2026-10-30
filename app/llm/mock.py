@@ -93,6 +93,10 @@ def _extract_recipient(text: str) -> str | None:
         if m:
             # 去掉口语前缀：「我妈」→「妈」，「俺老王」→「老王」
             name = re.sub(r"^(我的|我|俺)", "", m.group(1).strip())
+            # 去掉口语后缀：「给王强手机号转200」抠出来的是「王强手机号」，
+            # 拿去做联系人匹配必然 P-011「未找到收款人」——用户看着名单上有王强，
+            # 却被系统告知找不到，只会以为系统坏了。
+            name = re.sub(r"(手机号|手机|电话号码|电话|号码|的)$", "", name)
             if name in _PRONOUNS:
                 return None
             return name
@@ -278,7 +282,48 @@ class MockLLM(LLMAdapter):
         # 3.5) 卡片管理。★ 顺序必须是「解挂 → 挂失 → 申请 → 查询」：
         #     「解除挂失」同时含「挂失」，顺序反了会把解挂理解成再挂一次——
         #     这种错误不报错、不崩溃，只是把用户的卡又锁了一遍。
-        if re.search(r"(卡|挂失|解挂|解冻|解封)", seg) and not re.search(r"(账单|流水|消费记录)", seg):
+        if re.search(r"(卡|挂失|解挂|解冻|解封|额度|限额|交易限制)", seg) and not re.search(r"(账单|流水|消费记录)", seg):
+            # ★ 三条的顺序同样有讲究，和下面「解挂→挂失」是一个道理：
+            #   ① 调额：「把尾号 2233 的卡限额调到 2000」——含「卡」但不该被当成查询
+            #   ② 解除交易限制必须先于「解挂/解冻」：它同时含「解除」，顺序反了会被
+            #      理解成「解挂」，把一张只是限制交易的卡当成挂失卡去处理
+            #   ③ 「限制交易」必须先于「锁定/停用 → 挂失」：限制交易不等于挂失
+            m_lim = re.search(
+                r"(?:额度|限额|单日限额)[^0-9]{0,8}?(?:调到|调成|调为|改为|设为|提到|提高到|降到|降为)"
+                r"[^0-9]{0,4}?(\d+(?:\.\d{1,2})?)",
+                seg,
+            )
+            if m_lim:
+                card = _extract_card_keyword(seg)
+                cents = int(Decimal(m_lim.group(1)) * 100)
+                slots = {"new_daily_limit_cents": cents}
+                if card:
+                    slots["card"] = card
+                return Intent(
+                    name="adjust_card_limit",
+                    slots=slots,
+                    missing=[] if card else ["card"],
+                    confidence=1.0 if card else 0.6,
+                    raw_utterance=seg,
+                )
+            if re.search(r"(解除交易限制|取消交易限制|恢复交易|恢复用卡)", seg):
+                card = _extract_card_keyword(seg)
+                return Intent(
+                    name="unlock_card_transactions",
+                    slots={"card": card} if card else {},
+                    missing=[] if card else ["card"],
+                    confidence=1.0 if card else 0.6,
+                    raw_utterance=seg,
+                )
+            if re.search(r"(限制交易|禁止交易|禁用交易|关闭交易|限制这张卡)", seg):
+                card = _extract_card_keyword(seg)
+                return Intent(
+                    name="lock_card_transactions",
+                    slots={"card": card} if card else {},
+                    missing=[] if card else ["card"],
+                    confidence=1.0 if card else 0.6,
+                    raw_utterance=seg,
+                )
             if re.search(r"(解挂|解冻|解封|解锁|解除|恢复用卡|恢复交易)", seg):
                 card = _extract_card_keyword(seg)
                 return Intent(
@@ -311,6 +356,18 @@ class MockLLM(LLMAdapter):
 
         # 3.6) 理财。★ 「申购」必须有金额，缺了就追问，绝不默认一个金额。
         if re.search(r"(理财|基金|申购|赎回|年化|收益率|稳健型|进取型)", seg):
+            # ★ 「赎回」必须先于「申购」判断：它含「回」不含「买」，
+            #   但和申购在同一大类里，顺序反了会被当成「查询理财」——
+            #   用户说「赎回稳健增利」，系统的回答是「在售 4 只」，钱一分没回来。
+            if re.search(r"(赎回|取出|取回|退出)", seg):
+                slots = {}
+                product = _extract_product_keyword(seg)
+                if product:
+                    slots["product"] = product
+                amount = _extract_amount_cents(seg)
+                if amount:
+                    slots["amount_cents"] = amount
+                return Intent(name="redeem_wealth", slots=slots, raw_utterance=seg)
             buy = re.search(r"(申购|买入|购入|认购|买进)", seg) or (
                 re.search(r"(买|投|购)", seg) and _extract_amount_cents(seg) is not None
             )

@@ -11,6 +11,21 @@ import threading
 from app.bank.db import new_id
 from app.schemas import UserContext
 
+class SessionOwnershipError(Exception):
+    """`session_id` 存在，但不属于当前登录用户。
+
+    ★ 为什么必须有这一条：`session_id` 在响应体、前端状态、审计导出里都是明文，
+      它不是令牌。此前 `get_or_create` 命中已有会话就直接返回，从不比对归属——
+      于是任何人拿到别人的 `session_id`，后续裁决、执行、审计全部按**别人**的身份跑
+      （读别人的卡、用别人挂着的验证码、从别人账户扣钱）。
+      身份层的第三层是「数据归属」，这一条就是它的入口守卫。
+    """
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(session_id)
+        self.session_id = session_id
+
+
 _lock = threading.Lock()
 _sessions: dict[str, UserContext] = {}
 # ★ 槽位续接：上一轮追问「还差什么」，这一轮用户很可能只补那一个词。
@@ -27,6 +42,10 @@ def get_or_create(session_id: str | None, user_id: str, kyc_level: int = 1) -> U
         if ctx is None:
             ctx = UserContext(user_id=user_id, session_id=sid, kyc_level=kyc_level, trace_id=new_id("tr_"))
             _sessions[sid] = ctx
+        elif ctx.user_id != user_id:
+            # 会话归属不符 → 当作「不存在」。对外一律 404，不告诉调用方
+            # 「这个 id 是别人的」，否则等于确认了它的存在。
+            raise SessionOwnershipError(sid)
         # 每次请求刷新 trace_id，便于审计按「一轮对话」聚合
         ctx.trace_id = new_id("tr_")
         return ctx

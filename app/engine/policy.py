@@ -52,6 +52,7 @@ POLICY_RULES: dict[str, str] = {
     "P-043": "同一收款人当日累计超出限额，硬性拒绝",
     "P-044": "单笔金额达到强验证阈值，升级为红色",
     "P-050": "账户 KYC 等级不足，禁止该操作",
+    "P-070": "风险适当性不匹配：产品风险等级高于客户风险偏好，硬性拒绝",
     "P-090": "一句话里命中提示注入特征，且请求涉及资金或高风险操作，整轮阻断",
     "P-061": "本会话已完成用户确认，黄色放行",
     "P-062": "本会话已完成多因子认证，红色放行",
@@ -157,7 +158,15 @@ class PolicyEngine:
         if meta.precheck is not None:
             problem = meta.precheck(conn, ctx.user_id, args)
             if problem:
-                return deny(RiskLevel.YELLOW, problem, "P-011")
+                # 前置检查可以自己说明该记哪条规则：解析不到目标 = P-011（问一句就能解决），
+                # 风险适当性不匹配 = P-070（合规硬拦，说多少遍都解决不了）。
+                if isinstance(problem, tuple):
+                    reason, hit = problem
+                    # 除「目标解析」外的前置拒绝都是硬性问题，按红色记
+                    level = RiskLevel.YELLOW if hit == "P-011" else RiskLevel.RED
+                else:
+                    reason, hit, level = problem, "P-011", RiskLevel.YELLOW
+                return deny(level, reason, hit)
 
         # ---- 4. 非资金类：直接按基级 ----
         if not meta.is_fund_movement:
@@ -171,8 +180,11 @@ class PolicyEngine:
         #   不需要改本文件一行（旧写法是 assert isinstance(args, TransferArgs)，
         #   第二个资金类工具一注册就会断言失败）。
         amount = int(getattr(args, "amount_cents", 0) or 0)
-        if amount <= 0:
+        if amount <= 0 and not meta.amount_optional:
             # 声明了动钱却拿不到金额，属于工具定义错误。fail-closed。
+            # ★ 例外只有一处：工具自己声明 amount_optional=True（理财赎回的
+            #   「全部赎回」），此时 0/None 有确定语义，不是信息缺失。
+            #   缺金额仍是默认拒绝——这条不能因为个别工具放宽而整体放宽。
             return deny(RiskLevel.RED, "资金类操作缺少有效金额，已拒绝", "P-010")
 
         hits = ["P-030"]
@@ -278,7 +290,10 @@ class PolicyEngine:
                 + ("；该收款人是首次收款" if facts.get("first_time") else "")
             )
         else:
-            reason = f"本次 {_yuan(amount)}；风险等级 {level.value}"
+            # amount_optional 的工具（理财赎回）允许「不填金额 = 全部」，
+            # 此时回显不能说「本次 ¥0.00」——那是把「全部」说成了「零」。
+            what = _yuan(amount) if amount > 0 else "全部持仓"
+            reason = f"本次 {what}；风险等级 {level.value}"
         # 只有真正写入转账台账的操作才计入当日累计，
         # 否则「买完理财就转不出钱」——那不是安全，是 bug。
         return self._finalize(step, meta, level, ctx, hits, reason, facts), (
@@ -300,11 +315,15 @@ class PolicyEngine:
         """把风险等级映射成执行策略，并处理「本会话已验证」的放行。"""
         outcome = LEVEL_TO_OUTCOME[level]
 
-        # 一次性放行凭证：用过即失效（由 orchestrator 在消费后清空）
-        if outcome == DecisionOutcome.CONFIRM and "confirm" in ctx.verified_factors:
+        # ★ 一次性放行凭证：只放行**用户实际确认过的那一步**，且用过即失效。
+        #   修之前只看「本会话有 confirm/mfa 凭证」，不看是哪一步——
+        #   于是一句「确认」会连带放行计划里同级别的后续步骤（卡片上甚至没列出来）。
+        #   ctx.verified_for_step 由 orchestrator 在恢复执行前写入被确认的 step_id。
+        same_step = bool(ctx.verified_for_step) and ctx.verified_for_step == step.id
+        if outcome == DecisionOutcome.CONFIRM and "confirm" in ctx.verified_factors and same_step:
             outcome = DecisionOutcome.ALLOW
             hits = hits + ["P-061"]
-        elif outcome == DecisionOutcome.MFA and "mfa" in ctx.verified_factors:
+        elif outcome == DecisionOutcome.MFA and "mfa" in ctx.verified_factors and same_step:
             outcome = DecisionOutcome.ALLOW
             hits = hits + ["P-062"]
 

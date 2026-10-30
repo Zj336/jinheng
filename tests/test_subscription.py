@@ -34,6 +34,37 @@ def test_query_is_auto_executed():
     assert "全年约" in r.text
 
 
+def test_renewal_reminder_only_counts_the_next_seven_days():
+    """★ 续费提醒是拉取式的：问就答，而且只报**未来 7 天真的要扣的钱**。
+
+    用户真正要的问题不是「我买了几个会员」，是「这张卡下周会不会被扣穿」。
+    口径必须严：窗口外的订阅不能算进来，否则提醒就变成吓唬人。
+    """
+    from datetime import date
+
+    r = Orchestrator().handle_message(USER, "t_sub_soon", "我有哪些订阅")
+    data = r.executed[0]["result"]["data"]
+    soon = data["upcoming_7d"]
+    assert soon, "演示数据里应当有一条明天就到期的订阅"
+    today = date.today()
+    for x in soon:
+        d = date.fromisoformat(x["date"])
+        assert 0 <= (d - today).days <= 7
+    assert data["upcoming_7d_cents"] == sum(x["amount_cents"] for x in soon)
+
+    with connect() as conn:
+        rows = active_subscriptions(conn, USER)
+    outside = [
+        row for row in rows
+        if row["next_charge_date"]
+        and not (0 <= (date.fromisoformat(row["next_charge_date"]) - today).days <= 7)
+    ]
+    assert outside, "演示数据里也应当有窗口外的订阅，用来证明提醒不是全量罗列"
+    for row in outside:
+        assert row["merchant"] not in {x["merchant"] for x in soon}
+    assert "未来 7 天将自动扣费" in r.text
+
+
 def test_cancel_waits_for_confirmation():
     orch = Orchestrator()
     r = orch.handle_message(USER, "t_sub", "取消爱奇艺会员")

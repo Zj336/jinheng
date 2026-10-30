@@ -108,6 +108,10 @@ class UserContext(BaseModel):
     daily_transferred_cents: int = 0
     # 本会话已通过的多因子凭证，例如 {"mfa": "sms", "verified_at": ...}
     verified_factors: list[str] = Field(default_factory=list)
+    # ★ 凭证的作用范围：它只放行**这一个** step_id。
+    #   空串表示凭证不对应任何步骤（此时一律不放行）。
+    #   「一次确认 = 一步」这件事必须由数据结构表达，不能靠调用方自觉。
+    verified_for_step: str = ""
     # 本会话累计被拒次数 / 注入特征命中次数（熔断用）
     denied_count: int = 0
     injection_hits: int = 0

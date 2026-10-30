@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from typing import Any
 
 import httpx
 
@@ -197,7 +198,17 @@ class OpenAICompatLLM(LLMAdapter):
                 raw="",
             )
 
-        return self._to_proposal(content)
+        try:
+            return self._to_proposal(content)
+        except Exception as exc:  # noqa: BLE001
+            # ★ 模型输出千奇百怪（返回数组、confidence 写成「高」、args 写成字符串）。
+            #   修之前这些都会冒到 FastAPI 变成裸 500，并且 `connect()` 的 rollback
+            #   会把这一轮的审计（含注入命中）一起抹掉——出错的那一轮恰好没有记录。
+            #   现在一律降级成「这轮没听懂」，审计照写，用户可换个说法重来。
+            return Proposal(
+                clarifications=[f"理解模块返回了无法使用的结构，已中止本次请求（{type(exc).__name__}）。"],
+                raw=content or "",
+            )
 
     def _to_proposal(self, content: str) -> Proposal:
         content = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", (content or "").strip())
@@ -206,20 +217,36 @@ class OpenAICompatLLM(LLMAdapter):
         except json.JSONDecodeError:
             return Proposal(clarifications=["理解模块返回了无法解析的结果，已中止本次请求。"], raw=content)
 
-        intents = [
-            Intent(
-                name=str(i.get("name", "unknown")),
-                slots=dict(i.get("slots") or {}),
-                missing=list(i.get("missing") or []),
-                confidence=float(i.get("confidence", 1.0)),
+        if not isinstance(obj, dict):
+            # 模型返回了 `[1,2]` 这种顶层数组：结构不对，整轮作废，不猜。
+            return Proposal(
+                clarifications=["理解模块返回的不是一个 JSON 对象，已中止本次请求。"], raw=content
             )
-            for i in obj.get("intents", [])
-            if isinstance(i, dict)
-        ]
+
+        def _as_dict(v: Any) -> dict:
+            return v if isinstance(v, dict) else {}
+
+        def _as_list(v: Any) -> list:
+            return v if isinstance(v, list) else []
+
+        intents: list[Intent] = []
+        for i in _as_list(obj.get("intents")):
+            if not isinstance(i, dict):
+                continue
+            try:
+                conf = float(i.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                conf = 1.0
+            intents.append(Intent(
+                name=str(i.get("name", "unknown")),
+                slots=_as_dict(i.get("slots")),
+                missing=[str(m) for m in _as_list(i.get("missing"))],
+                confidence=min(1.0, max(0.0, conf)),
+            ))
 
         steps: list[Step] = []
         notes: list[str] = []
-        for n, raw_step in enumerate(obj.get("steps") or []):
+        for n, raw_step in enumerate(_as_list(obj.get("steps"))):
             if not isinstance(raw_step, dict):
                 continue
             when = None
@@ -234,15 +261,15 @@ class OpenAICompatLLM(LLMAdapter):
             steps.append(Step(
                 id=str(raw_step.get("id") or f"s{n + 1}"),
                 tool=str(raw_step.get("tool", "")),
-                args=dict(raw_step.get("args") or {}),
-                depends_on=list(raw_step.get("depends_on") or []),
+                args=_as_dict(raw_step.get("args")),
+                depends_on=[str(d) for d in _as_list(raw_step.get("depends_on"))],
                 when=when,
             ))
 
         return Proposal(
             intents=intents,
             plan=Plan(steps=steps, summary=""),
-            clarifications=[str(c) for c in (obj.get("clarifications") or [])] + notes,
+            clarifications=[str(c) for c in _as_list(obj.get("clarifications"))] + notes,
             raw=content,
         )
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -26,6 +27,9 @@ CREATE TABLE IF NOT EXISTS users (
     kyc_level   INTEGER NOT NULL DEFAULT 1,
     -- ★ 角色只能由后台写入。任何「我是管理员」的自然语言声明都到不了这一列。
     role        TEXT NOT NULL DEFAULT 'customer',
+    -- ★ 风险偏好（适当性管理）：只能由风险测评/后台写入，不来自对话。
+    --   与 role 同一条规矩——客户在聊天里说「我可以承受高风险」不算数。
+    risk_pref   TEXT NOT NULL DEFAULT '稳健',
     created_at  TEXT NOT NULL,
     -- 登录口令。★ 存 PBKDF2 哈希而不是明文/裸哈希：
     -- 6 位纯数字的裸 sha256 与明文没有实质区别。
@@ -182,6 +186,14 @@ CREATE TABLE IF NOT EXISTS handoff_tickets (
     created_at TEXT NOT NULL
 );
 
+-- 库级元信息。目前只存一件事：审计链用的是哪一版算法。
+-- ★ 不存它的话，升级链算法的那一天，全库会一起报「被篡改」——
+--   完好的历史数据被判成作案现场，比不升级更糟。
+CREATE TABLE IF NOT EXISTS app_meta (
+    k TEXT PRIMARY KEY,
+    v TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_ledger_user_day ON transfer_ledger(user_id, ts);
 CREATE INDEX IF NOT EXISTS idx_cards_user     ON cards(user_id);
 CREATE INDEX IF NOT EXISTS idx_wealth_user    ON wealth_orders(user_id, ts);
@@ -230,6 +242,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # 角色：只能由后台/种子数据写入，永远不来自用户输入。
     if "role" not in have:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'customer'")
+    if "risk_pref" not in have:
+        conn.execute("ALTER TABLE users ADD COLUMN risk_pref TEXT NOT NULL DEFAULT '稳健'")
 
     have_a = {r["name"] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()}
     added = False
@@ -243,10 +257,38 @@ def _migrate(conn: sqlite3.Connection) -> None:
         backfill_audit_chain(conn)
 
 
+def _ensure_audit_alg(conn: sqlite3.Connection) -> None:
+    """把全库审计链对齐到当前算法版本（v1 纯 SHA-256 → v2 HMAC-SHA256）。
+
+    ★ 不做这一步的后果：老库里每一行的 row_hash 都是用旧算法算的，
+      切算法当天，`/api/audit/verify` 会对着一个**完好无损**的库报
+      「第 N 行被改过」——把最招牌的诚实功能变成一个假警报。
+    ★ 代价也要说清楚：重算等于抹掉迁移前的历史指纹，所以只能承诺
+      「迁移之后没被改过」。这个取舍写在 docs/安全自评报告.md 里。
+    """
+    row = conn.execute("SELECT v FROM app_meta WHERE k=?", (AUDIT_ALG_KEY,)).fetchone()
+    if row is not None and row["v"] == AUDIT_ALG:
+        return
+    n = backfill_audit_chain(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO app_meta(k, v) VALUES (?, ?)", (AUDIT_ALG_KEY, AUDIT_ALG)
+    )
+    # 重链本身也是一件事，必须留痕——否则「审计日志被整体重写」这件事
+    # 就发生在审计系统内部而无人知晓。用 audit() 写，才能自动挂到新链尾上。
+    audit(
+        conn,
+        trace_id=new_id("mig_"),
+        stage="audit_chain_rekey",
+        payload={"from_alg": (row["v"] if row else "sha256/v1"),
+                 "to_alg": AUDIT_ALG, "rewritten_rows": n},
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
         _migrate(conn)
+        _ensure_audit_alg(conn)
 
 
 def reset_db() -> None:
@@ -317,7 +359,7 @@ def daily_transferred_cents(conn: sqlite3.Connection, user_id: str, day: str | N
     day = day or date.today().isoformat()
     row = conn.execute(
         """SELECT COALESCE(SUM(amount_cents), 0) AS s FROM transfer_ledger
-           WHERE user_id=? AND status='executed' AND substr(ts,1,10)=?""",
+           WHERE user_id=? AND status IN ('executed','scheduled') AND substr(ts,1,10)=?""",
         (user_id, day),
     ).fetchone()
     return int(row["s"])
@@ -328,7 +370,7 @@ def monthly_transferred_cents(conn: sqlite3.Connection, user_id: str, month: str
     month = month or date.today().isoformat()[:7]
     row = conn.execute(
         """SELECT COALESCE(SUM(amount_cents), 0) AS s FROM transfer_ledger
-           WHERE user_id=? AND status='executed' AND substr(ts,1,7)=?""",
+           WHERE user_id=? AND status IN ('executed','scheduled') AND substr(ts,1,7)=?""",
         (user_id, month),
     ).fetchone()
     return int(row["s"])
@@ -344,7 +386,7 @@ def transferred_to_contact_today_cents(
     day = day or date.today().isoformat()
     row = conn.execute(
         """SELECT COALESCE(SUM(amount_cents), 0) AS s FROM transfer_ledger
-           WHERE user_id=? AND contact_id=? AND status='executed' AND substr(ts,1,10)=?""",
+           WHERE user_id=? AND contact_id=? AND status IN ('executed','scheduled') AND substr(ts,1,10)=?""",
         (user_id, contact_id, day),
     ).fetchone()
     return int(row["s"])
@@ -546,15 +588,54 @@ def list_wealth_orders(conn: sqlite3.Connection, user_id: str) -> list[sqlite3.R
 # ------------------------------------------------------------------ 审计
 
 AUDIT_GENESIS = "GENESIS"
+AUDIT_ALG_KEY = "audit_chain_alg"
+AUDIT_ALG = "hmac-sha256/v1"
+
+_AUDIT_KEY_LABEL = b"jinheng/audit-chain/v1"
+_audit_key_cache: bytes | None = None
+
+
+def audit_key() -> bytes:
+    """审计链的 HMAC 密钥。
+
+    ★ 为什么不满足于纯 SHA-256（我们 v1 的做法）：
+      纯哈希是**公开算法 + 公开输入**。任何能 UPDATE audit_log 的人，
+      改一行内容之后把这一行及其后所有行重算一遍，整条链立刻「完整」。
+      链能证明「没被手滑改过」，证明不了「没被有写权限的人改过」。
+      换成 HMAC 之后，密钥不在数据库里（在 data/.auth_secret，生产走 KMS），
+      改库的人算不出新指纹，链才真正具备「篡改必留痕」。
+
+    ★ 为什么要「派生」而不是直接复用身份密钥：
+      一个密钥只干一件事。签名令牌和签名审计共用一把，等于两处任一泄漏
+      同时打穿另一处。这里用 HMAC(身份密钥, 固定标签) 派生出审计专用子密钥，
+      子密钥泄漏也反推不出身份密钥（HMAC 的单向性），轮换也互不影响。
+
+    ★ 为什么放在函数里 import：app.auth 反向依赖链上会有 db（auth 要读用户），
+      模块顶层 import 会造成循环导入。这里只 import 一个函数，且只在真正写审计时才触发。
+    """
+    global _audit_key_cache
+    if _audit_key_cache is not None:
+        return _audit_key_cache
+
+    env = os.getenv("JH_AUDIT_HMAC_KEY", "").strip()
+    if env:
+        # 环境变量给的是人可读的字符串，先摘要成定长字节再做 HMAC 密钥
+        _audit_key_cache = hashlib.sha256(env.encode("utf-8")).digest()
+        return _audit_key_cache
+
+    from app.auth import _secret
+
+    _audit_key_cache = hmac.new(_secret(), _AUDIT_KEY_LABEL, hashlib.sha256).digest()
+    return _audit_key_cache
 
 
 def _audit_digest(prev_hash: str, row: tuple) -> str:
-    """一行的指纹 = H(上一行指纹 ‖ 本行全部字段)。
+    """一行的指纹 = HMAC_K(上一行指纹 ‖ 本行全部字段)。
 
     ★ 用 \\x1f 分隔而不是直接拼接：不分隔的话 "ab"+"c" 和 "a"+"bc" 指纹相同，
       构造两行不同的记录得到同一个哈希，链就白加了。
     """
-    h = hashlib.sha256()
+    h = hmac.new(audit_key(), digestmod=hashlib.sha256)
     h.update((prev_hash or AUDIT_GENESIS).encode("utf-8"))
     for part in row:
         h.update(b"\x1f")
@@ -613,13 +694,35 @@ def verify_audit_chain(
     rows = conn.execute(sql, (*args, limit)).fetchall()
     rows = list(reversed(rows))
 
-    prev = AUDIT_GENESIS
+    if not rows:
+        return {"ok": True, "checked": 0, "first_bad_id": None, "head": AUDIT_GENESIS,
+                "reason": "没有可校验的审计记录"}
+
+    # ★ 起点不能想当然地写成 GENESIS。两个真踩过的坑：
+    #   ① 行数超过 limit 时窗口是从中间截断的，窗口第一行的 prev_hash 指向窗口外，
+    #      拿 GENESIS 去比会把**完好**的库报成「被篡改」——最招牌的功能谎报灾情。
+    #   ② 带 session_id 过滤时，本会话的行在全局链里是不连续的，
+    #      相邻两行本该「本行 prev = 上一行 row_hash」的假设根本不成立。
+    #      这种情况只能逐行回查它**全局意义上的前一行**。
+    has_older = conn.execute(
+        "SELECT 1 FROM audit_log WHERE id<? LIMIT 1", (rows[0]["id"],)
+    ).fetchone() is not None
+    prev = rows[0]["prev_hash"] if has_older else AUDIT_GENESIS
+    windowed = has_older or session_id is not None
+
     checked = 0
     for r in rows:
-        if r["prev_hash"] != prev:
+        expect_prev = prev
+        if session_id:
+            pred = conn.execute(
+                "SELECT row_hash FROM audit_log WHERE id<? ORDER BY id DESC LIMIT 1",
+                (r["id"],),
+            ).fetchone()
+            expect_prev = pred["row_hash"] if pred else AUDIT_GENESIS
+        if r["prev_hash"] != expect_prev:
             return {
                 "ok": False, "checked": checked, "first_bad_id": r["id"],
-                "reason": f"第 {r['id']} 行的 prev_hash 与上一行的 row_hash 不一致（{r['prev_hash']} ≠ {prev}）",
+                "reason": f"第 {r['id']} 行的 prev_hash 与上一行的 row_hash 不一致（{r['prev_hash']} ≠ {expect_prev}）",
             }
         want = _audit_digest(
             r["prev_hash"], (r["trace_id"], r["ts"], r["user_id"], r["session_id"], r["stage"], r["payload"])
@@ -631,8 +734,10 @@ def verify_audit_chain(
             }
         prev = r["row_hash"]
         checked += 1
-    return {"ok": True, "checked": checked, "first_bad_id": None,
-            "reason": f"连续校验 {checked} 行，链完整", "head": prev}
+    scope = "本会话" if session_id else ("最近 %d 行" % limit if windowed else "全库")
+    return {"ok": True, "checked": checked, "first_bad_id": None, "head": prev,
+            "scope": scope,
+            "reason": f"{scope}连续校验 {checked} 行，链完整"}
 
 
 def backfill_audit_chain(conn: sqlite3.Connection) -> int:

@@ -20,7 +20,9 @@ from app.schemas import DecisionOutcome, RiskLevel, ToolResult, UserContext
 # 前置解析钩子：给定 (conn, user_id, args)，返回 None 表示可继续，
 # 返回字符串表示「这个操作根本不可能成功」的原因。
 # 由策略引擎在裁决前调用，属于纯代码、不接触自然语言。
-Precheck = Callable[[sqlite3.Connection, str, BaseModel], "str | None"]
+# 返回值：None = 可继续；str = 原因（命中 P-011「目标无法解析」）；
+# (原因, 策略编号) = 原因 + 该由哪条规则来记这次拒绝（如适当性不匹配是 P-070）。
+Precheck = Callable[[sqlite3.Connection, str, BaseModel], "str | tuple[str, str] | None"]
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,10 @@ class ToolMeta:
     resolves_contact: bool = False
     # 该工具要求的最低 KYC 等级。理财申购要求 2 级（做过风险测评），转账 1 级。
     min_kyc: int = 1
+    # ★ 该工具的「金额」可以**不填**，语义为「全部」（理财赎回用）。
+    #   默认 False：凡是动钱的工具，拿不到金额就必须 fail-closed 拒绝——
+    #   这个默认值本身就是防线，别为了让某个新工具跑通就改成 True。
+    amount_optional: bool = False
 
 
 REGISTRY: dict[str, ToolMeta] = {}
