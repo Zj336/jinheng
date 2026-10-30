@@ -1,0 +1,26 @@
+# 生成代码沙箱的攻击用例
+#
+# 场景前提：账单分析里的分析代码是「模型生成的代码」，因此它是**不可信输入**。
+# 攻击者可能通过提示注入诱导模型输出恶意代码。这里的每个 payload 都按
+# 「如果它真的跑起来会怎样」来设计。
+#
+# expect 取值：
+#   static  —— 静态闸门拒绝，进程根本不启动
+#   timeout —— 跑起来了，被超时终止
+#   memory  —— 跑起来了，被内存看门狗终止
+#   output  —— 跑起来了，输出超过上限被丢弃
+#   isolated—— 跑完了，但没碰到不该碰的东西（隔离生效）
+#   allow   —— 正常代码，应当成功
+
+cases:
+  - {id: SBX-01, desc: 直接 import 文件系统模块,          expect: static,  code: "import os\nresult = os.listdir('/')"}
+  - {id: SBX-02, desc: 用 __import__ 绕过 import 语句,   expect: static,  code: "result = __import__('os').getcwd()"}
+  - {id: SBX-03, desc: 读任意文件,                       expect: static,  code: "result = open('/etc/passwd').read()"}
+  - {id: SBX-04, desc: 通过双下划线属性爬上对象树,        expect: static,  code: "result = ().__class__.__bases__"}
+  - {id: SBX-05, desc: eval 执行动态字符串,              expect: static,  code: "result = eval('__import__(\"os\")')"}
+  - {id: SBX-06, desc: 取全局命名空间,                   expect: static,  code: "result = globals()"}
+  - {id: SBX-07, desc: 死循环耗尽 CPU,                   expect: timeout, code: "while True:\n    pass\n"}
+  - {id: SBX-08, desc: 内存炸弹,                          expect: memory,  code: "a = []\nwhile True:\n    a.append('x' * 1000000)\n"}
+  - {id: SBX-09, desc: 超大输出撑爆下游,                  expect: output,  code: "result = 'x' * (400 * 1024)"}
+  - {id: SBX-10, desc: 篡改传入数据（隔离验证）,          expect: isolated, code: "data.clear()\nresult = {'cleared': True}"}
+  - {id: SBX-11, desc: 正常分析代码（对照组）,            expect: allow,   code: "out = [i for i in data['items'] if i['direction'] == 'out']\nresult = {'n': len(out), 'cents': sum(i['amount_cents'] for i in out)}"}

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.db
+# ★ 令牌签名密钥是**本机生成**的,推上去等于把演示账号的令牌签发权一起送出去。
+data/.auth_secret
+.env
+.pytest_cache/
+*.log
