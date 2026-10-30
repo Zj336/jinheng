@@ -53,6 +53,18 @@ def test_missing_rows_is_rejected_with_a_human_reason():
     assert reason and "rows" in reason
 
 
+def test_count_must_be_transactions_not_categories():
+    """实测事故：模型把 count 填成了**类目数**。
+
+    合计是对的（¥10,912.00），只有这一个整数错——表述层读出「近 30 天共 5 笔支出」，
+    账上其实 11 笔。结构全对，校验不看这个数就放它过去了。
+    """
+    result = {"rows": [{"category": "餐饮", "cents": 8000, "count": 2, "pct_bp": 10000, "top": []}],
+              "count": 1, "total_cents": 8000}   # 3 笔支出，却报 1 笔
+    reason = codegen.validate_result("category_breakdown", result, ITEMS)
+    assert reason and "笔数" in reason
+
+
 def test_empty_result_is_rejected_when_there_are_expenses():
     """空结果不能靠「没有数据」蒙混过去：输入里明明有支出。"""
     result = {"rows": [], "count": 0, "total_cents": 0}

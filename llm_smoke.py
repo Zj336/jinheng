@@ -90,12 +90,14 @@ def classify(r) -> tuple[str, str]:
         # P-001 = 工具不在白名单，本质是「这功能我没有」，与听不懂等价
         return (f"{C_ORG}🟠{C_END}", f"规则拒({hits})") if "P-001" not in hits \
             else (f"{C_RED}❌{C_END}", "听不懂(工具不支持)")
+    # 「接不住」是 mock 词表耗尽时说的话，属于**听不懂**，不是追问。
+    # 它同样会带 clarify（mock 把帮助文本放在 clarifications 里），所以这条必须先判。
+    if any(k in text for k in ("没听懂", "听不懂", "不理解", "接不住")):
+        return f"{C_RED}❌{C_END}", "听不懂"
     if getattr(r, "clarify", None):
         # 由引擎直接告诉我们是追问，而不是靠回复里有没有「还差」去猜 ——
         # 真模型生成的追问不含这两个字，会被错记成「其他(说明类)」。
         return f"{C_DIM}🟡{C_END}", "追问(缺槽位)"
-    if any(k in text for k in ("没听懂", "听不懂", "不理解", "接不住", "抱歉")):
-        return f"{C_RED}❌{C_END}", "听不懂"
     return f"{C_DIM}·{C_END}", "其他(说明类)"
 
 

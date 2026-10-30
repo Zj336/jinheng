@@ -45,7 +45,7 @@ python run.py
 ```bash
 python selfcheck.py          # 期望：三项全 PASS，退出码 0（它就是上面三条的合集）
 python demo.py               # 期望：50/50 通过
-python -m pytest tests -q    # 期望：125 passed
+python -m pytest tests -q    # 期望：126 passed
 python eval_report.py        # 期望：31/31 与 11/11
 ```
 
@@ -322,7 +322,7 @@ jinheng/
 │   ├── tools/              工具注册表与实现（12 个工具 / 6 个场景）
 │   ├── eval/               对抗评估（31 条攻击 + 对照系统）
 │   └── api/routes.py       HTTP 接口
-├── tests/                  125 个用例（含 test_security_hardening.py 10 条、test_codegen_contract.py 13 条）
+├── tests/                  126 个用例（含 test_security_hardening.py 10 条、test_codegen_contract.py 14 条）
 ├── docs/                   权限分级规格（安全自评报告待补）
 ├── eval/                   attacks.yaml / sandbox_attacks.yaml
 ├── demo.py                 演示 + 验收脚本（14 场景 / 50 断言）

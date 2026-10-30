@@ -240,6 +240,20 @@ def validate_result(goal: str, result, items: list[dict]) -> str | None:
         key = {"category_breakdown": "category", "top_merchants": "merchant", "trend": "week"}[goal]
         if rows and key not in rows[0]:
             return f"rows 里缺少 {key} 字段"
+        # ★ 笔数也必须对得上。实测过的第二种「安静地答错」：
+        #   模型把 count 填成了**类目数**（5），而表述层把它读成「共 5 笔支出」，
+        #   合计又是对的——用户看到「近 30 天共 5 笔支出，合计 ¥10,912.00」，
+        #   账上其实是 11 笔。结构全对，只有一个整数错，校验不看它就是放它过去。
+        if goal == "category_breakdown":
+            n = result.get("count")
+            if not isinstance(n, int):
+                return "缺少整数 count"
+            if out_items and n != len(out_items):
+                return f"笔数对不上：结果说 {n} 笔，输入实际有 {len(out_items)} 笔支出"
+        elif goal == "top_merchants":
+            n = result.get("count")
+            if isinstance(n, int) and out_items and n != len(out_items):
+                return f"笔数对不上：结果说 {n} 笔，输入实际有 {len(out_items)} 笔支出"
         return None
 
     if goal == "anomalies":
