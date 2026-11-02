@@ -27,6 +27,7 @@ from app.bank.db import (
     get_contact,
     has_paid_contact,
     monthly_transferred_cents,
+    recent_new_recipients_cents,
     transferred_to_contact_today_cents,
 )
 from app.config import settings
@@ -51,6 +52,7 @@ POLICY_RULES: dict[str, str] = {
     "P-042": "当月累计转账超出限额，硬性拒绝",
     "P-043": "同一收款人当日累计超出限额，硬性拒绝",
     "P-044": "单笔金额达到强验证阈值，升级为红色",
+    "P-045": "分散转出：短期内向多个新收款人合计转出超阈值，硬性拒绝（反洗钱）",
     "P-050": "账户 KYC 等级不足，禁止该操作",
     "P-070": "风险适当性不匹配：产品风险等级高于客户风险偏好，硬性拒绝",
     "P-090": "一句话里命中提示注入特征，且请求涉及资金或高风险操作，整轮阻断",
@@ -241,8 +243,34 @@ class PolicyEngine:
                     "P-043",
                 )
 
-            # ---- 7. 单笔阈值 / 首次收款人 → 升级 ----
+            # ---- 6.5 ★ 反洗钱：分散转出（P-045）----
+            #
+            # 上面三道限额各有盲区：日限额防「一天拆几笔」、月限额防「天天拆」、
+            # 收款人限额防「盯着一个人转」。但有一类结构三条全拦不住——
+            # **把金额摊到多个新收款人身上、跨几天转完**（典型的结构化拆分）。
+            # 每一笔单看都合规，合起来才是问题。只看单日/单月/单人的体系，
+            # 对这种形状是瞎的，而它恰恰是最常见的一种。
             first_time = not has_paid_contact(conn, ctx.user_id, contact["id"])
+            n_new, total_new = recent_new_recipients_cents(
+                conn, ctx.user_id, settings.aml_window_days
+            )
+            # 本笔若转给一个新收款人，它还没进台账，要把它算进预测值
+            proj_n = n_new + 1 if first_time else n_new
+            proj_total = total_new + (amount if first_time else 0)
+            if proj_n >= settings.aml_new_recipients and proj_total >= settings.aml_total_cents:
+                return deny(
+                    RiskLevel.RED,
+                    f"近 {settings.aml_window_days} 天你已向 {proj_n} 个新收款人合计转出 "
+                    f"{_yuan(proj_total)}，达到分散转出阈值"
+                    f"（{settings.aml_new_recipients} 个新收款人 / "
+                    f"{_yuan(settings.aml_total_cents)}），本次转账被拒（P-045）。\n"
+                    f"   把大额拆成多笔转给不同的人是常见的规避手法，"
+                    f"这条规则专门盯这种形状；验证码**不能**覆盖它，"
+                    f"确属正常用途请回复「转人工」走人工复核。",
+                    "P-045",
+                )
+
+            # ---- 7. 单笔阈值 / 首次收款人 → 升级 ----
             if amount >= self.single_confirm_limit_cents:
                 level = escalate(escalate(level, 1), 1) if first_time else escalate(level, 1)
                 hits.append("P-044")

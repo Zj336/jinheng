@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -41,6 +42,16 @@ async def lifespan(_app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         print(f"[warn] 演示数据初始化跳过：{exc}")
     print(f"[jinheng] LLM 模式 = {settings.llm_mode}（mock 模式无需任何 API Key）")
+
+    # ★ 预约任务调度器：只有 run.py 会打开它（JH_SCHEDULER=1）。
+    #   pytest / demo / eval 一律不启动——一个后台线程会在用例中途改数据库，
+    #   把「可复现」变成「看运气」，而这类偶发失败最难查。
+    if os.getenv("JH_SCHEDULER", "0") == "1":
+        from app.engine.scheduler import start_background
+
+        start_background(float(os.getenv("JH_SCHEDULER_INTERVAL", "60")))
+        print("[jinheng] 预约转账调度器已启动（每分钟扫一次到期预约）")
+
     yield
 
 

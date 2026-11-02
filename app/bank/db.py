@@ -392,6 +392,38 @@ def transferred_to_contact_today_cents(
     return int(row["s"])
 
 
+def recent_new_recipients_cents(
+    conn: sqlite3.Connection, user_id: str, days: int = 7, today: str | None = None
+) -> tuple[int, int]:
+    """近 N 天**第一次出现**的收款人数量，以及这些人合计转出多少钱（分）。
+
+    ★ 为什么需要它：已有的三道限额各有盲区——
+        P-040（日）防「一天拆成几笔」，P-042（月）防「一个月转太多」，
+        P-043（同一收款人）防「盯着一个人转」。
+      但有一类结构三条全拦不住：**把金额摊到多个新收款人身上、跨几天转完**。
+      一个只看单日、单月、单人的体系，对这种形状是瞎的。
+
+    「新收款人」的口径取**全历史首次转入时间**，而不是窗口内出现过：
+    只有从没转过的人才算新账户，否则常来往的朋友会被误伤。
+    由于首次时间落在窗口内，这个人的全部转账自然也都在窗口内，
+    所以第二个返回值可以只按收款人汇总、不必再按日期过滤。
+    """
+    today = today or date.today().isoformat()
+    start = (date.fromisoformat(today) - timedelta(days=days)).isoformat()
+    row = conn.execute(
+        """SELECT COUNT(*) AS n, COALESCE(SUM(w.total), 0) AS total FROM (
+               SELECT contact_id, SUM(amount_cents) AS total, MIN(ts) AS first_ts
+               FROM transfer_ledger
+               WHERE user_id=? AND contact_id IS NOT NULL
+                 AND status IN ('executed','scheduled')
+               GROUP BY contact_id
+           ) w
+           WHERE w.first_ts >= ?""",
+        (user_id, start),
+    ).fetchone()
+    return int(row["n"]), int(row["total"])
+
+
 def has_paid_contact(conn: sqlite3.Connection, user_id: str, contact_id: str) -> bool:
     """是否曾经给这个联系人转过账（用于「首次收款人」升级判定）。"""
     row = conn.execute(

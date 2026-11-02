@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -33,6 +34,10 @@ def main() -> None:
     # 地址同时监听同一个端口（一个 0.0.0.0、一个 127.0.0.1），谁抢到看运气，
     # 于是同一个链接可能打开别人的页面。换端口比杀进程安全。
     port = arg if arg.isdigit() else DEFAULT_PORT
+
+    # 起服务时把预约转账调度器一起打开（子进程继承环境变量）。
+    # 想关掉：$env:JH_SCHEDULER="0"; python run.py
+    os.environ.setdefault("JH_SCHEDULER", "1")
 
     subprocess.run(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--reload", "--port", port],

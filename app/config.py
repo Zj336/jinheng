@@ -78,6 +78,16 @@ class Settings:
     # 2026-10-30 才接进裁决，「配置里有、代码里不用」本身就是个坑）
     single_confirm_limit_cents: int = _i("JH_CONFIRM_LIMIT_CENTS", 50_000)    # 500.00 元
 
+    # ---- 反洗钱：分散转出（P-045）----
+    # 日限额防「一天拆几笔」、月限额防「天天拆」、收款人限额防「盯着一个人」——
+    # 三条都拦不住「摊给多个新收款人、跨几天转完」。这是结构化拆分的典型形状：
+    # 每一笔单看都合规，合起来才是问题。
+    # 阈值刻意设在日限额之上（2000 元 > 1000 元/日），保证正常的多笔小额
+    # （房租 + 水电 + 还朋友钱）不会误伤——它必须跨天才可能触发。
+    aml_window_days: int = _i("JH_AML_WINDOW_DAYS", 7)                        # 观察窗口
+    aml_new_recipients: int = _i("JH_AML_NEW_RECIPIENTS", 3)                  # 几个新收款人起疑
+    aml_total_cents: int = _i("JH_AML_TOTAL_CENTS", 200_000)                  # 合计 2000.00 元
+
     # ---- 熔断 ----
     circuit_fail_threshold: int = _i("JH_CIRCUIT_FAILS", 3)
     circuit_inject_threshold: int = _i("JH_CIRCUIT_INJECTS", 4)

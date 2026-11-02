@@ -45,7 +45,7 @@ python run.py
 ```bash
 python selfcheck.py          # 期望：三项全 PASS，退出码 0（它就是上面三条的合集）
 python demo.py               # 期望：50/50 通过
-python -m pytest tests -q    # 期望：135 passed
+python -m pytest tests -q    # 期望：146 passed
 python eval_report.py        # 期望：31/31 与 11/11
 ```
 
@@ -303,7 +303,8 @@ jinheng/
 │   ├── engine/
 │   │   ├── guard.py        L1 输入隔离与注入特征
 │   │   ├── dag.py          DAG 校验（白名单 / Schema / 无环）
-│   │   ├── policy.py       ★ 确定性权限引擎（P-040/042/043 硬拒，P-090 整轮阻断）
+│   │   ├── policy.py       ★ 确定性权限引擎（P-040/042/043/045 硬拒，P-090 整轮阻断）
+│   │   ├── scheduler.py    ★ 预约转账调度器（幂等 / 逾期补跑 / 失败留痕）
 │   │   ├── executor.py     确定性执行器
 │   │   ├── render.py       ★ 表述层（幻觉防护落点 / 确认卡片 / 消费下钻）
 │   │   ├── followup.py     ★ 槽位续接（系统自己提的问题要能接住）
@@ -322,7 +323,7 @@ jinheng/
 │   ├── tools/              工具注册表与实现（16 个工具 / 6 个场景）
 │   ├── eval/               对抗评估（31 条攻击 + 对照系统）
 │   └── api/routes.py       HTTP 接口
-├── tests/                  135 个用例（含 test_security_hardening.py 15 条、test_codegen_contract.py 11 条）
+├── tests/                  146 个用例（含 test_security_hardening.py 15 条、test_codegen_contract.py 11 条）
 ├── docs/                   权限分级规格 / 安全自评报告
 ├── eval/                   attacks.yaml / sandbox_attacks.yaml
 ├── demo.py                 演示 + 验收脚本（14 场景 / 50 断言）
@@ -370,7 +371,11 @@ jinheng/
 
 **已实现（可演示）**
 
-- [x] **智能转账**：即时 / 预约（预约**不当场扣款**，只占用到期日的额度；演示环境未开调度器）
+- [x] **智能转账**：即时 / 预约（预约**不当场扣款**，只占用到期日的额度）
+- [x] **预约转账调度器**：到期自动执行（幂等、逾期补跑、余额不足记 `failed` 并落审计），
+      `run.py` 启动时自动开启；也支持 `python -m app.engine.scheduler --once`
+- [x] **反洗钱 P-045（分散转出）**：7 天内 3 个**新**收款人合计 ≥ 2000 元即硬拒。
+      日/月/单人三道限额对「摊给多个新收款人、跨几天转完」这种形状是盲的，这条专门补它
 - [x] **账单分析**：自然语言 → 生成分析代码 → 沙箱执行 → 结构化结论
 - [x] **订阅 / 代扣管理**：查询订阅（绿，含「未来 7 天将自动扣费」续费提醒）、取消订阅（黄，确认后执行）
 - [x] **卡片管理**：查询（绿）、申请虚拟卡（黄）、挂失与解挂（红）、调额（红）、锁定/解除交易限制（黄/红）
