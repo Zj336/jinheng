@@ -43,10 +43,11 @@ python run.py
 验证是否一切正常：
 
 ```bash
-python selfcheck.py          # 期望：三项全 PASS，退出码 0（它就是上面三条的合集）
+python selfcheck.py          # 期望：四项全 PASS，退出码 0（它就是下面四条再加 evaluate.py 的合集）
 python demo.py               # 期望：50/50 通过
-python -m pytest tests -q    # 期望：148 passed
+python -m pytest tests -q    # 期望：154 passed（Linux/macOS）；153 passed, 1 skipped（Windows）
 python eval_report.py        # 期望：31/31 与 11/11
+python evaluate.py           # 期望：五组消融 + 24 条正常业务，退出码 0
 ```
 
 > ⚠️ **两个会让人误判红的环境坑**（都不是功能坏了）：
@@ -344,12 +345,15 @@ jinheng/
 │   ├── tools/              工具注册表与实现（16 个工具 / 6 个场景）
 │   ├── eval/               对抗评估（31 条攻击 + 对照系统）
 │   └── api/routes.py       HTTP 接口
-├── tests/                  148 个用例（含 test_security_hardening.py 15 条、test_codegen_contract.py 11 条）
-├── docs/                   权限分级规格 / 安全自评报告
-├── eval/                   attacks.yaml / sandbox_attacks.yaml
+├── tests/                  154 个用例（含 test_security_hardening.py 15 条、test_codegen_contract.py 11 条、
+│                           test_eval_extended.py 6 条）
+├── docs/                   权限分级规格 / 安全自评报告 / 技术文档
+├── eval/                   attacks.yaml / normal.yaml / sandbox_attacks.yaml
+├── validation/             评测证据（extended.json / 验证成果.md / 源码哈希清单）
 ├── demo.py                 演示 + 验收脚本（14 场景 / 50 断言）
 ├── eval_report.py          对抗评估报告
-├── selfcheck.py            ★ 一键自检（串起上面三套并给总判决）
+├── evaluate.py             ★ 消融评测 + 定向边界探针 + 正常业务（证据导出到 validation/）
+├── selfcheck.py            ★ 一键自检（串起上面四套并给总判决）
 ├── capabilities.py         ★ 能力清单（读工具注册表，--json 可机读）
 ├── llm_smoke.py            ★ 真模型联调表（mock vs 真模型并排对照，无断言）
 ├── .github/workflows/ci.yml   CI：在 ubuntu 上跑同一条 selfcheck.py

@@ -19,9 +19,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+_check_tmp = tempfile.TemporaryDirectory(prefix="statera-selfcheck-")
 
 # ★ 自检自己也要说人话。
 #   `python selfcheck.py` 的 stdout 在 Windows 上跟着控制台代码页走（cp936），
@@ -47,6 +49,7 @@ _CHILD_ENV = {
     # ★ 自检的三个子进程一律走 mock：自检回答的是「系统对不对」，不是「模型今天发挥如何」。
     #   联调期间 .env 里可能配着真模型，验收结论不能跟着模型措辞漂移。
     "JH_LLM_MODE": "mock",
+    "JH_DB": str(Path(_check_tmp.name) / "bank.db"),
 }
 
 
@@ -159,6 +162,13 @@ def main() -> int:
         "对抗评估 eval_report.py", code == 0,
         "防御 " + defend + "；" + baseline + "；" + sandbox,
     ))
+
+    # ★ 必须另指定输出名：默认目标是 validation/extended.json，
+    #   那是随包提交的评测证据。跑一次自检就把它重写掉，
+    #   等于「评委一验收，证据就变了」——虽然 mock 下内容一致，但说不清。
+    code, out = _run(["evaluate.py", "--json", "validation/selfcheck_extended.json"])
+    checks.append(("消融与正常业务 evaluate.py", code == 0,
+                   "逐条结果见 validation/selfcheck_extended.json"))
 
     print()
     for name, ok, detail in checks:

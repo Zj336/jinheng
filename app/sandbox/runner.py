@@ -12,7 +12,7 @@
    并且它看不到任何密钥 —— 子进程的环境变量是重建的，不是继承的。
 
 ★ 已知局限（必须写进安全自评报告）：
-   1. 内存看门狗靠 50ms 轮询 RSS，不是内核级硬限；瞬时冲高可能越过上限。
+   1. POSIX 子进程使用 RLIMIT_AS 地址空间限制，另有 50ms RSS 轮询；Windows 仅 RSS 轮询，瞬时冲高可能越过阈值。
    2. Windows 无 seccomp/CGroup，隔离强度弱于 Linux 容器方案。
    3. 未做网络命名空间隔离；由于禁止 import socket 且无第三方库，
       实际可达路径为零，但这属于「事实上的」而非「机制上的」保证。
@@ -58,6 +58,15 @@ _INTERPRETER = _sandbox_interpreter()
 # 子进程里可用的内建函数 —— 只留纯计算用的，一个 I/O 相关的都没有
 _BOOTSTRAP = r'''
 import json, sys
+
+# Set a child-side POSIX address-space cap as well as the parent RSS watchdog.
+# A launcher can make the parent's /proc PID refer to a wrapper process.
+try:
+    import resource
+    limit = int(sys.argv[1]) * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+except (ImportError, OSError, ValueError):
+    pass  # Windows and unsupported platforms retain the RSS watchdog.
 
 SAFE = {
     "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
@@ -239,7 +248,7 @@ def run_code(code: str, data: dict, timeout_s: float | None = None,
         )
 
     payload = json.dumps({"code": code, "data": data}, ensure_ascii=False)
-    cmd = [_INTERPRETER, "-I", "-X", "utf8", "-c", _BOOTSTRAP]
+    cmd = [_INTERPRETER, "-I", "-X", "utf8", "-c", _BOOTSTRAP, str(mem_mb)]
 
     tmpdir = tempfile.mkdtemp(prefix="jh_sbx_")
     state: dict = {"killed": ""}
@@ -294,6 +303,9 @@ def run_code(code: str, data: dict, timeout_s: float | None = None,
                              elapsed_ms=elapsed, code_digest=digest)
 
     if not parsed.get("ok"):
+        if str(parsed.get("error", "")).startswith("MemoryError:"):
+            return SandboxResult(ok=False, error="分析代码触发内存限制", elapsed_ms=elapsed,
+                                 code_digest=digest, killed="memory")
         return SandboxResult(ok=False, error=parsed.get("error", "分析代码执行出错"),
                              elapsed_ms=elapsed, code_digest=digest)
 

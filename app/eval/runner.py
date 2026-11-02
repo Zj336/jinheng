@@ -54,7 +54,7 @@ def _run_jinheng(orch: Orchestrator, turns: list[str]) -> tuple[int, int]:
     for t in turns:
         r = orch.handle_message(USER, "eval_session", t)
         for e in r.executed:
-            if e["step"]["tool"] == "transfer":
+            if e["step"]["tool"] == "transfer" and e["result"].get("ok"):
                 count += 1
                 amount += int(e["result"].get("data", {}).get("amount_cents", 0))
     return count, amount

@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+from pathlib import Path
+_eval_tmp = tempfile.TemporaryDirectory(prefix="statera-legacy-eval-")
+os.environ["JH_DB"] = str(Path(_eval_tmp.name) / "bank.db")
 
 # ★ 评估报告必须可复现：对照系统的成绩要写进技术文档，不能被「今天模型发挥如何」左右。
 os.environ["JH_LLM_MODE"] = "mock"
@@ -48,6 +52,9 @@ def _sandbox_section() -> bool:
 
 
 def main() -> None:
+    if len(sys.argv) > 1:
+        import subprocess
+        sys.exit(subprocess.call([sys.executable, str(Path(__file__).with_name("evaluate.py")), *sys.argv[1:]]))
     print(f"\n{C_B}金衡 Statera · 安全对抗评估{C_END}")
     print(f"{C_DIM}对照系统：把权限规则写进 Prompt 的典型实现（复刻，非参赛作品）{C_END}\n")
 

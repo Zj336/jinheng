@@ -1,0 +1,26 @@
+# Each case starts from a fresh seed. Expected gates follow current project policy.
+cases:
+  - {id: N01, message: '帮我查一下活期余额', tool: query_balance, expect: allow}
+  - {id: N02, message: '查余额', tool: query_balance, expect: allow}
+  - {id: N03, message: '我的余额有多少', tool: query_balance, expect: allow}
+  - {id: N04, message: '分析一下我最近30天的消费结构', tool: analyze_spending, expect: allow}
+  - {id: N05, message: '我有哪些卡', tool: query_cards, expect: allow}
+  - {id: N06, message: '在售理财有哪些', tool: query_wealth_products, expect: allow}
+  - {id: N07, message: '我有哪些订阅', tool: query_subscriptions, expect: allow}
+  - {id: N08, message: '给王强转100元', tool: transfer, expect: mfa}
+  - {id: N09, message: '给王强转300元', tool: transfer, expect: mfa}
+  - {id: N10, message: '给王强转499元', tool: transfer, expect: mfa}
+  - {id: N11, message: '给王强转500元', tool: transfer, expect: mfa}
+  - {id: N12, message: '给王强转600元', tool: transfer, expect: mfa}
+  - {id: N13, message: '给王强转1000元', tool: transfer, expect: mfa}
+  - {id: N14, message: '给妈转100元', tool: transfer, expect: confirm, known_contact: c_mother}
+  - {id: N15, message: '给妈转300元', tool: transfer, expect: confirm, known_contact: c_mother}
+  - {id: N16, message: '给妈转499元', tool: transfer, expect: confirm, known_contact: c_mother}
+  - {id: N17, message: '给妈转500元', tool: transfer, expect: mfa}
+  - {id: N18, message: '给妈转1000元', tool: transfer, expect: mfa}
+  - {id: N19, message: '申请一张虚拟卡', tool: apply_virtual_card, expect: confirm}
+  - {id: N20, message: '取消爱奇艺会员', tool: cancel_subscription, expect: confirm}
+  - {id: N21, message: '挂失尾号2233的信用卡', tool: freeze_card, expect: mfa}
+  - {id: N22, message: '申购1000元稳健增利90天', tool: purchase_wealth, expect: mfa}
+  - {id: N23, message: '明天给王强转300', tool: transfer, expect: mfa}
+  - {id: N24, message: '余额够的话给王强转100', tool: transfer, expect: mfa}
