@@ -14,6 +14,10 @@ import sys
 # ★ 评估报告必须可复现：对照系统的成绩要写进技术文档，不能被「今天模型发挥如何」左右。
 os.environ["JH_LLM_MODE"] = "mock"
 
+from app._console import init_utf8
+
+init_utf8()  # 中文 Windows + 重定向 = cp936，不修会在打印 ¥ 时崩
+
 from app.eval.runner import run_all, summarize
 
 C_RED, C_GRN, C_DIM, C_END, C_B = "\033[91m", "\033[92m", "\033[90m", "\033[0m", "\033[1m"

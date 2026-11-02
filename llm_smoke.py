@@ -38,6 +38,10 @@ BASE_DIR = Path(__file__).resolve().parent
 #   用独立的库文件，避免把联调产生的脏数据写进演示库。
 os.environ.setdefault("JH_DB", str(BASE_DIR / "data" / "smoke.db"))
 
+from app._console import init_utf8  # noqa: E402
+
+init_utf8()  # ★ 本文件要打印 ✅ 🟡 🟠 ❌ 💥，中文 Windows 的控制台/管道是 cp936，不修直接崩
+
 from app.bank.db import init_db  # noqa: E402
 from app.bank.seed import seed  # noqa: E402
 from app.engine.orchestrator import Orchestrator  # noqa: E402

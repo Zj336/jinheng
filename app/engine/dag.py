@@ -18,6 +18,19 @@ STEP_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 FIELD_RE = re.compile(r"^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)*$")
 MAX_STEPS = 12
 
+# ★ 身份类字段严禁出现在 args 里。
+#   模型完全可以在 args 里塞 {"role": "admin"}：pydantic 默认忽略多余字段，
+#   所以它今天不会生效（身份由 UserContext 从数据库拼装，任何工具都不接收身份入参）。
+#   但「悄悄丢掉」和「明确拒绝」对评审是两件事：
+#     · 悄悄丢掉 —— 你只能说「它不会有影响」，这是靠代码结构担保的推断；
+#     · 明确拒绝 —— 你能现场把这条计划打出来，说「这条被 P-010 判为非法并记了审计」。
+#   后者可演示、可复现，也把「以后某个新工具恰好声明了同名参数」这个隐患提前堵死。
+_IDENTITY_KEYS = frozenset({
+    "user_id", "uid", "user", "username", "role", "roles", "is_admin", "admin",
+    "kyc", "kyc_level", "permissions", "identity", "verified", "mfa", "mfa_verified",
+    "session_id", "trace_id", "token",
+})
+
 
 class DagError(ValueError):
     """计划非法。消息会原样写进审计日志。"""
@@ -41,6 +54,13 @@ def validate(plan: Plan) -> Plan:
     for s in plan.steps:
         if get_tool(s.tool) is None:
             raise DagError(f"步骤 {s.id} 使用了未注册的工具「{s.tool}」")
+        # ★ 身份类字段不许混进参数：模型能写进来，但写进来就是一次显式的 Schema 拒绝。
+        bad = sorted(k for k in s.args if str(k).strip().lower() in _IDENTITY_KEYS)
+        if bad:
+            raise DagError(
+                f"步骤 {s.id} 的参数里出现身份类字段（{'、'.join(bad)}）——"
+                f"身份只来自登录态，不接受任何来自自然语言的声明"
+            )
         for dep in s.depends_on:
             if dep not in id_set:
                 raise DagError(f"步骤 {s.id} 依赖了不存在的步骤 {dep}")

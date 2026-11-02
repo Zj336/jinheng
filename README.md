@@ -45,9 +45,18 @@ python run.py
 ```bash
 python selfcheck.py          # 期望：三项全 PASS，退出码 0（它就是上面三条的合集）
 python demo.py               # 期望：50/50 通过
-python -m pytest tests -q    # 期望：146 passed
+python -m pytest tests -q    # 期望：148 passed
 python eval_report.py        # 期望：31/31 与 11/11
 ```
+
+> ⚠️ **两个会让人误判红的环境坑**（都不是功能坏了）：
+> 1. **先把 `run.py` 停掉再跑自检。** 验收脚本要重建数据库（`os.remove`），
+>    而 Windows 上一个正在跑的 uvicorn 持有 `data/bank.db` 句柄 → 
+>    `PermissionError: [WinError 32]` → 看起来像「50 个用例全错」。
+>    实在不想停服务：`set JH_DB=D:\tmp\verify.db` 换个库跑。
+> 2. **不激活 venv 也能跑。** `selfcheck.py` 发现当前解释器缺依赖会自动切到
+>    `.venv` 重跑（打印一行 `[环境] …`）；切不过去才报一条能看懂的错，
+>    而不是把 `No module named pytest` 伪装成 `[FAIL] 未匹配到`。
 
 ---
 
@@ -305,6 +314,7 @@ GET /api/audit/verify  →  {ok: true, checked: 312, first_bad_id: null, head: "
 ```
 jinheng/
 ├── app/
+│   ├── _console.py         ★ 入口统一 UTF-8（中文 Windows 重定向 = cp936，不修会崩在打印结果处）
 │   ├── schemas.py          全系统数据契约（强类型）
 │   ├── config.py           所有阈值集中在此
 │   ├── auth.py             ★ 会话身份：口令换令牌（PBKDF2 + HMAC 签名）
@@ -334,7 +344,7 @@ jinheng/
 │   ├── tools/              工具注册表与实现（16 个工具 / 6 个场景）
 │   ├── eval/               对抗评估（31 条攻击 + 对照系统）
 │   └── api/routes.py       HTTP 接口
-├── tests/                  146 个用例（含 test_security_hardening.py 15 条、test_codegen_contract.py 11 条）
+├── tests/                  148 个用例（含 test_security_hardening.py 15 条、test_codegen_contract.py 11 条）
 ├── docs/                   权限分级规格 / 安全自评报告
 ├── eval/                   attacks.yaml / sandbox_attacks.yaml
 ├── demo.py                 演示 + 验收脚本（14 场景 / 50 断言）

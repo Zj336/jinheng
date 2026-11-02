@@ -15,6 +15,10 @@ from __future__ import annotations
 import json
 import sys
 
+from app._console import init_utf8
+
+init_utf8()  # 中文 Windows 下重定向输出是 cp936，不统一成 UTF-8 会崩在打印结果处
+
 from app.bank.seed import seed  # noqa: F401  （触发数据库初始化路径）
 import app.tools  # noqa: F401  （导入即注册）
 from app.tools.base import REGISTRY

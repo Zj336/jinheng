@@ -60,6 +60,32 @@ def test_dag_rejects_unregistered_tool():
         validate(plan)
 
 
+def test_dag_rejects_identity_fields_in_args():
+    """模型能往 args 里写身份类字段，但写进来就是一次显式的 Schema 拒绝。
+
+    为什么值得单独一条：pydantic 默认忽略多余字段，所以「模型写 role=admin」
+    今天本来就无效——身份由 UserContext 从数据库拼装，没有任何工具接收身份入参。
+    但「悄悄丢掉」只能说「不会有影响」，是推断；「明确拒绝」可以当场演示，
+    且以后某个新工具恰好声明同名参数时，这条规则会自动挡住。
+    """
+    plan = Plan(
+        steps=[
+            Step(id="s1", tool="transfer",
+                 args={"to": "妈妈", "amount_cents": 100000, "role": "admin"}),
+        ]
+    )
+    with pytest.raises(DagError, match="身份类字段"):
+        validate(plan)
+
+
+def test_dag_allows_normal_args():
+    """对照组：正常参数不能被这条规则误伤（否则等于把所有转账都拒了）。"""
+    plan = Plan(
+        steps=[Step(id="s1", tool="transfer", args={"to": "妈妈", "amount_cents": 100})]
+    )
+    assert [s.id for s in validate(plan).steps] == ["s1"]
+
+
 def test_dag_topo_sorts():
     plan = Plan(
         steps=[

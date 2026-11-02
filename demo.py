@@ -17,6 +17,12 @@ import sys
 #   真模型的表现由 llm_smoke.py 单独衡量（只出对照表，不设断言）。
 os.environ["JH_LLM_MODE"] = "mock"
 
+# ★ 中文 Windows + 管道输出 = cp936，打印 ✓ ✅ ¥ 会直接 UnicodeEncodeError 崩在结果行。
+#   必须在任何打印之前修好，否则「手敲正常、重定向就崩」会让人以为功能坏了。
+from app._console import init_utf8
+
+init_utf8()
+
 from app.bank.sms import latest_code
 
 from app.bank.seed import seed
